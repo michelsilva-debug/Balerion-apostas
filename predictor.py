@@ -122,17 +122,21 @@ FUSO_BRT             = -3
 
 RHO_DIXON_COLES      = -0.13
 
-ARQUIVO_BUDGET       = "budget_predictor.json"
+# FIX: estado em diretório configurável. No Railway, monte um volume persistente
+# e defina DATA_DIR=/data — senão o filesystem efêmero apaga tudo a cada deploy.
+DATA_DIR             = os.getenv("DATA_DIR", ".")
 
-ARQUIVO_CACHE        = "predictor_cache.json"
+ARQUIVO_BUDGET       = os.path.join(DATA_DIR, "budget_predictor.json")
 
-ARQUIVO_LOG          = "predictor_log.json"
+ARQUIVO_CACHE        = os.path.join(DATA_DIR, "predictor_cache.json")
 
-ARQUIVO_ODDS_SNAP    = "odds_snapshot.json"
+ARQUIVO_LOG          = os.path.join(DATA_DIR, "predictor_log.json")
 
-ARQUIVO_RELATORIO    = "relatorio_semanal.json"
+ARQUIVO_ODDS_SNAP    = os.path.join(DATA_DIR, "odds_snapshot.json")
 
-ARQUIVO_PARAMS       = "modelo_params.json"
+ARQUIVO_RELATORIO    = os.path.join(DATA_DIR, "relatorio_semanal.json")
+
+ARQUIVO_PARAMS       = os.path.join(DATA_DIR, "modelo_params.json")
 
 JOGOS_PARA_RETREINAR = 5
 
@@ -380,6 +384,29 @@ def peso_temporal(dt_str: str) -> float:
 
 # ═══════════════════════════════════════════
 
+# ═══════════════════════════════════════════
+# PERSISTÊNCIA — escrita atômica + UTF-8
+# (grava em arquivo temporário e troca com os.replace: se o processo morrer
+#  no meio da escrita, o arquivo original não é corrompido)
+# ═══════════════════════════════════════════
+def _salvar_json(path: str, dados, indent=None) -> None:
+    import tempfile
+    pasta = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=pasta, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def carregar_budget() -> dict:
 
     hoje = datetime.now().strftime("%Y-%m-%d")
@@ -388,7 +415,7 @@ def carregar_budget() -> dict:
 
         if os.path.exists(ARQUIVO_BUDGET):
 
-            with open(ARQUIVO_BUDGET) as f:
+            with open(ARQUIVO_BUDGET, encoding="utf-8") as f:
 
                 d = json.load(f)
 
@@ -408,9 +435,7 @@ def salvar_budget(b: dict) -> None:
 
     try:
 
-        with open(ARQUIVO_BUDGET, "w") as f:
-
-            json.dump(b, f)
+        _salvar_json(ARQUIVO_BUDGET, b)
 
     except Exception as e:
 
@@ -446,7 +471,7 @@ def carregar_cache() -> dict:
 
         if os.path.exists(ARQUIVO_CACHE):
 
-            with open(ARQUIVO_CACHE) as f:
+            with open(ARQUIVO_CACHE, encoding="utf-8") as f:
 
                 raw = json.load(f)
 
@@ -468,9 +493,7 @@ def salvar_cache(c: dict) -> None:
 
     try:
 
-        with open(ARQUIVO_CACHE, "w") as f:
-
-            json.dump(c, f)
+        _salvar_json(ARQUIVO_CACHE, c)
 
     except Exception as e:
 
@@ -506,7 +529,7 @@ def carregar_log() -> list:
 
         if os.path.exists(ARQUIVO_LOG):
 
-            with open(ARQUIVO_LOG) as f:
+            with open(ARQUIVO_LOG, encoding="utf-8") as f:
 
                 return json.load(f)
 
@@ -526,9 +549,7 @@ def salvar_log(entrada: dict) -> None:
 
         log.append(entrada)
 
-        with open(ARQUIVO_LOG, "w") as f:
-
-            json.dump(log[-500:], f, ensure_ascii=False, indent=2)
+        _salvar_json(ARQUIVO_LOG, log[-500:], indent=2)
 
     except Exception as e:
 
@@ -564,7 +585,7 @@ def enviar_telegram(msg: str) -> None:
 
         except Exception as e:
 
-            print(f"[TELEGRAM] {e}")
+            print(f"[TELEGRAM] falha ao enviar: {type(e).__name__}")
 
 
 
@@ -1916,13 +1937,13 @@ def carregar_snapshots() -> dict:
 
         if os.path.exists(ARQUIVO_ODDS_SNAP):
 
-            with open(ARQUIVO_ODDS_SNAP) as f:
+            with open(ARQUIVO_ODDS_SNAP, encoding="utf-8") as f:
 
                 return json.load(f)
 
-    except Exception:
+    except Exception as e:
 
-        pass
+        print(f"[PERSIST] falha ao carregar snapshots: {e}")
 
     return {}
 
@@ -1932,13 +1953,11 @@ def salvar_snapshots(snaps: dict) -> None:
 
     try:
 
-        with open(ARQUIVO_ODDS_SNAP, "w") as f:
+        _salvar_json(ARQUIVO_ODDS_SNAP, snaps)
 
-            json.dump(snaps, f)
+    except Exception as e:
 
-    except Exception:
-
-        pass
+        print(f"[PERSIST] falha ao salvar snapshots: {e}")
 
 
 
@@ -2810,17 +2829,30 @@ def carregar_params_modelo() -> dict:
 
         if os.path.exists(ARQUIVO_PARAMS):
 
-            with open(ARQUIVO_PARAMS) as f:
+            with open(ARQUIVO_PARAMS, encoding="utf-8") as f:
 
                 saved = json.load(f)
 
             defaults.update(saved)
 
-    except Exception:
+    except Exception as e:
 
-        pass
+        print(f"[PERSIST] falha ao carregar params do modelo: {e}")
 
     return defaults
+
+
+
+def aplicar_params_globais(params: dict) -> None:
+    # FIX: o autoaprendizado salvava params em arquivo mas analisar_jogo nunca os lia,
+    # então o "modelo atualizado" não mudava nenhuma previsão. Aqui sincronizamos os
+    # parâmetros aprendidos de volta nas constantes globais que o motor realmente usa
+    # (matriz_placares lê RHO_DIXON_COLES; calcular_lambdas lê GAMMA_CASA; etc.).
+    global RHO_DIXON_COLES, PROB_MINIMA, LAMBDA_DECAY, GAMMA_CASA
+    RHO_DIXON_COLES = params.get("rho_dixon_coles", RHO_DIXON_COLES)
+    PROB_MINIMA     = params.get("prob_minima", PROB_MINIMA)
+    LAMBDA_DECAY    = params.get("lambda_decay", LAMBDA_DECAY)
+    GAMMA_CASA      = params.get("gamma_casa", GAMMA_CASA)
 
 
 
@@ -2828,13 +2860,11 @@ def salvar_params_modelo(params: dict) -> None:
 
     try:
 
-        with open(ARQUIVO_PARAMS, "w") as f:
+        _salvar_json(ARQUIVO_PARAMS, params, indent=2)
 
-            json.dump(params, f, ensure_ascii=False, indent=2)
+    except Exception as e:
 
-    except Exception:
-
-        pass
+        print(f"[PERSIST] falha ao salvar params do modelo: {e}")
 
 
 
@@ -3398,6 +3428,8 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     global relatorio_semanal_enviado
 
+    aplicar_params_globais(params_modelo)
+
     agora   = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     disponi = calls_disponiveis(budget)
@@ -3498,6 +3530,8 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     params_modelo = executar_autoaprendizado(params_modelo)
 
+    aplicar_params_globais(params_modelo)
+
     print(f"\n  ✅ Ciclo OK | {budget['calls_usadas']}/{BUDGET_DIARIO}")
 
     return budget, cache, params_modelo
@@ -3511,13 +3545,14 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 # ═══════════════════════════════════════════
 
 if __name__ == "__main__":
-    enviar_telegram("🤖 Sistema Iniciado com Sucesso! O bot está ativo e rodando no background.")
 
+    # FIX: valida as credenciais ANTES de tentar enviar qualquer Telegram
+    # (a notificação de boot ficava antes da validação e era duplicada).
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT or not APIFOOTBALL_KEY:
 
         print("❌ ERRO: defina as variáveis de ambiente:")
 
-        print("   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, APIFOOTBALL_KEY")
+        print("   TELEGRAM_TOKEN, TELEGRAM_CHAT, APIFOOTBALL_KEY")
 
         raise SystemExit(1)
 
@@ -3571,6 +3606,8 @@ if __name__ == "__main__":
 
     params_modelo = carregar_params_modelo()
 
+    aplicar_params_globais(params_modelo)
+
 
 
     print(f"  💰 Budget ({budget['data']}): {budget['calls_usadas']}/{BUDGET_DIARIO}")
@@ -3581,7 +3618,11 @@ if __name__ == "__main__":
 
 
 
-    enviar_telegram(
+    # FIX: notificação de boot opcional (defina NOTIFY_BOOT=0 no Railway para
+    # não receber esta mensagem a cada restart/redeploy do serviço).
+    if os.getenv("NOTIFY_BOOT", "1") == "1":
+
+        enviar_telegram(
 
         "🤖 TERRORNEGRO PREDICTOR v6.1 ONLINE\n🏆 Copa do Mundo 2026\n\n"
 
