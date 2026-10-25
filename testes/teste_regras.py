@@ -140,11 +140,26 @@ check(all(abs(pe[f"esc_over_{l}"] + pe[f"esc_under_{l}"] - 100) < 0.01 for l in 
 check(pe["esc_over_8.5"] > pe["esc_over_9.5"] > pe["esc_over_10.5"], f"linhas em ordem: {pe['esc_over_8.5']} > {pe['esc_over_9.5']} > {pe['esc_over_10.5']}")
 check(abs(sum(p._prob_total_nb(9.9, k) for k in range(80)) - 1) < 1e-6, "binomial negativa soma 1")
 
-print("\n### 10. Odds de handicap: as duas convenções das casas")
-prop = dict(p._chaves_ah([("Home -0.5", 1.9), ("Away +0.5", 1.95), ("Home -1", 2.4), ("Away +1", 1.55)]))
-mand = dict(p._chaves_ah([("Home -0.5", 1.9), ("Away -0.5", 1.95), ("Home -1", 2.4), ("Away -1", 1.55)]))
-check(prop.get("ah_fora@+0.50") == 1.95 and prop.get("ah_casa@-0.50") == 1.9, f"'Away +0.5' = visitante +0.5: {prop}")
-check(mand.get("ah_fora@+0.50") == 1.95 and mand.get("ah_fora@+1.00") == 1.55, f"'Away -0.5' (linha do mandante) = visitante +0.5: {mand}")
+print("\n### 10. Odds de handicap: convenção descoberta pelas odds")
+# mercado real: mandante favorito, linha justa ~ -0.75
+# (linha do mandante, odd mandante, odd visitante do MESMO par)
+MERC = [(-1.25, 2.40, 1.58), (-0.75, 1.95, 1.90), (-0.25, 1.62, 2.30), (0.25, 1.38, 3.00), (0.75, 1.20, 4.20)]
+def lista(convencao):
+    v = []
+    for lc, oc, of in MERC:
+        v.append((f"Home {lc:+g}", oc))
+        v.append((f"Away {(-lc if convencao == 'propria' else lc):+g}", of))
+    return v
+for conv in ("propria", "mandante"):
+    d = dict(p._chaves_ah(lista(conv)))
+    ok = (d.get("ah_fora@+1.25") == 1.58 and d.get("ah_casa@-1.25") == 2.40
+          and d.get("ah_fora@+0.75") == 1.90 and d.get("ah_fora@-0.75") == 4.20)
+    check(ok, f"casa escrevendo '{conv}': visitante +1.25 @1.58 e -0.75 @4.20 → {d.get('ah_fora@+1.25')}, {d.get('ah_fora@-0.75')}")
+# o caso que enganava a regra antiga: linhas positivas e negativas listadas
+d = dict(p._chaves_ah(lista("mandante")))
+check(d.get("ah_fora@+1.25") != 2.40 and d.get("ah_fora@+1.25") == 1.58, "não troca a odd do mandante pela do visitante")
+lixo = dict(p._chaves_ah([("Home -1.5", 1.9), ("Away +1.5", 3.5)]))   # 52.6% + 28.6% = 81%: par não fecha
+check(lixo == {}, f"par que não fecha (soma 81%) é descartado: {lixo}")
 
 print("\n### 11. Leitura das odds da API (AH, escanteios, ignora 1º tempo)")
 resp = [{"bookmakers": [{"name": "Bet365", "bets": [

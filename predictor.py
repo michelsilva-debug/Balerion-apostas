@@ -956,21 +956,43 @@ def buscar_odds_reais(fixture_id: int, budget: dict):
 def _chaves_ah(valores: list) -> list:
     """Converte "Home -1" / "Away +1" para a linha de cada time.
 
-    Algumas casas escrevem o visitante com a linha dele ("Away +1") e outras
-    com a linha do mandante ("Away -1"). Descobre a convenção pelos pares.
+    Algumas casas escrevem o visitante com a linha dele ("Away +1.25") e outras
+    com a linha do mandante ("Away -1.25"). Contar linhas empata quando a casa
+    lista linhas positivas e negativas, então a convenção é descoberta pelas
+    ODDS: num par certo (casa -1.25 x fora +1.25) as probabilidades implícitas
+    somam ~105%. Só entram linhas cujo par fecha (soma entre 97% e 120%).
     """
-    casa, fora = [], []
+    casa, fora = {}, {}
     for val, odd in valores:
         m = _RE_AH.match(val)
         if m:
-            (casa if m.group(1).lower() == "home" else fora).append((float(m.group(2)), odd))
-    linhas_casa = {l for l, _ in casa}
-    propria = sum(1 for l, _ in fora if -l in linhas_casa)
-    do_mandante = sum(1 for l, _ in fora if l in linhas_casa and l != 0)
-    sinal = -1 if do_mandante > propria else 1
-    out = [(f"ah_casa@{l:+.2f}", o) for l, o in casa]
-    out += [(f"ah_fora@{sinal * l:+.2f}", o) for l, o in fora]
-    return out
+            alvo = casa if m.group(1).lower() == "home" else fora
+            alvo.setdefault(float(m.group(2)), odd)
+
+    def erro(par_da_linha):
+        e = [abs(1 / o + 1 / casa[par_da_linha(l)] - 1.05)
+             for l, o in fora.items() if l != 0 and par_da_linha(l) in casa]
+        return sum(e) / len(e) if e else None
+
+    e_propria = erro(lambda l: -l)      # "Away +1.25" -> par "Home -1.25"
+    e_mandante = erro(lambda l: l)      # "Away -1.25" (linha do mandante) -> par "Home -1.25"
+    if e_propria is None and e_mandante is None:
+        sinal = 1
+    elif e_propria is None:
+        sinal = -1
+    elif e_mandante is None:
+        sinal = 1
+    else:
+        sinal = -1 if e_mandante < e_propria else 1
+
+    out = []
+    for l, oa in fora.items():
+        linha_fora = sinal * l
+        oc = casa.get(-linha_fora)
+        if oc and 0.97 <= 1 / oa + 1 / oc <= 1.20:
+            out.append((f"ah_fora@{linha_fora:+.2f}", oa))
+            out.append((f"ah_casa@{-linha_fora:+.2f}", oc))
+    return list(dict(out).items())
 
 
 _estats = {"dados": None}
