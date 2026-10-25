@@ -26,7 +26,7 @@ from collections import defaultdict
 
 # ╔══════════════════════════════════════════════════════════════╗
 
-# ║ TERRORNEGRO PREDICTOR v6.1 — COPA DO MUNDO 2026            ║
+# ║ BALERION PREDICTOR v7.0 — LIGAS (BR, EUROPA, CONMEBOL)     ║
 
 # ║                                                              ║
 
@@ -64,7 +64,7 @@ from collections import defaultdict
 
 # ║ • Relatório semanal inteligente (domingos 9h BRT)          ║
 
-# ║ • Histórico em 3 camadas (Copa → Elim → Liga)              ║
+# ║ • Histórico: últimos jogos do time em todas as competições ║
 
 # ║ • Decaimento exponencial por recência                      ║
 
@@ -112,9 +112,9 @@ MONTE_CARLO_N        = 100_000
 
 LAMBDA_DECAY         = 0.04
 
-BUDGET_DIARIO        = 80
+BUDGET_DIARIO        = int(os.getenv("BUDGET_DIARIO", "90"))  # plano grátis = 100/dia
 
-BUDGET_EMERGENCIA    = 10
+BUDGET_EMERGENCIA    = 5
 
 INTERVALO_CICLO_MIN  = 30
 
@@ -138,13 +138,35 @@ ARQUIVO_RELATORIO    = os.path.join(DATA_DIR, "relatorio_semanal.json")
 
 ARQUIVO_PARAMS       = os.path.join(DATA_DIR, "modelo_params.json")
 
+ARQUIVO_FIXTURES     = os.path.join(DATA_DIR, "fixtures_cache.json")
+
 JOGOS_PARA_RETREINAR = 5
 
-CASAS_VALUE  = ["Bet365", "Pinnacle", "Betano", "Betfair", "Sportingbet"]
+# Casas usadas nas value bets (só odds REAIS dessas casas entram no cálculo).
+# Configure no Railway com CASAS="Bet365,Betano,Pinnacle" etc.
+CASAS_VALUE  = [c.strip() for c in os.getenv(
+    "CASAS", "Bet365,Betano,Pinnacle,Betfair,Sportingbet").split(",") if c.strip()]
 
-WORLD_CUP_ID = 1
+# ─────────────────────────────────────────
+# LIGAS MONITORADAS (id da API-Football → nome)
+# A ordem define a prioridade quando o orçamento de chamadas é curto.
+# ─────────────────────────────────────────
+LIGAS = {
+    71:  "Brasileirão Série A",
+    13:  "Libertadores",
+    11:  "Sul-Americana",
+    2:   "Champions League",
+    39:  "Premier League",
+    140: "La Liga",
+    135: "Serie A (Itália)",
+    78:  "Bundesliga",
+}
 
-WORLD_CUP_SEASON = 2026
+# Analisa jogos que começam dentro desta janela
+HORAS_ANTECEDENCIA = 24
+
+# Chamadas por jogo analisado: histórico casa, histórico fora, H2H, odds, desfalques
+CALLS_POR_JOGO = 5
 
 
 
@@ -597,256 +619,213 @@ def enviar_telegram(msg: str) -> None:
 
 BASE_URL = "https://v3.football.api-sports.io"
 
+# Plano grátis da API-Football limita requisições por minuto: espaçamos as chamadas.
+INTERVALO_MIN_CHAMADAS = float(os.getenv("API_INTERVALO_SEG", "6.5"))
+
+_ultima_chamada = [0.0]
+
+_aviso_erro_api = {"dia": None}
+
+
+def _registrar_erro_api(endpoint: str, params: dict, erros) -> None:
+    texto = json.dumps(erros, ensure_ascii=False)[:300]
+    print(f"  [API] {endpoint} {params} → ERRO: {texto}")
+    hoje = agora_brt().strftime("%Y-%m-%d")
+    graves = ("plan", "season", "access", "token", "key", "suspend", "limit")
+    if _aviso_erro_api["dia"] != hoje and any(p in texto.lower() for p in graves):
+        _aviso_erro_api["dia"] = hoje
+        enviar_telegram(
+            "⚠️ BALERION — a API-Football recusou uma requisição\n"
+            f"{endpoint}: {texto}\n\n"
+            "Se for restrição do plano grátis (temporada não liberada ou "
+            "limite diário), o bot fica sem dados até isso ser resolvido.")
 
 
 def api_get(endpoint: str, params: dict, budget: dict):
-
     if calls_disponiveis(budget) <= BUDGET_EMERGENCIA:
-
         return [], budget
-
+    espera = INTERVALO_MIN_CHAMADAS - (time.time() - _ultima_chamada[0])
+    if espera > 0:
+        time.sleep(espera)
+    _ultima_chamada[0] = time.time()
     try:
-
         r = requests.get(
-
             f"{BASE_URL}/{endpoint}",
-
             headers={"x-apisports-key": APIFOOTBALL_KEY},
-
             params=params, timeout=15,
-
         )
-
         budget = registrar_call(budget)
-
-        rem = r.headers.get("x-ratelimit-requests-remaining")
-
-        if rem and int(rem) < 15:
-
-            print(f"  ⚠️ API mensal: {rem} restantes!")
-
+        # Sincroniza o contador local com o contador real da API
+        lim = r.headers.get("x-ratelimit-requests-limit", "")
+        rem = r.headers.get("x-ratelimit-requests-remaining", "")
+        if lim.isdigit() and rem.isdigit():
+            usadas_api = int(lim) - int(rem)
+            if usadas_api > budget["calls_usadas"]:
+                budget["calls_usadas"] = usadas_api
+                salvar_budget(budget)
+            if int(rem) < 15:
+                print(f"  ⚠️ API: só {rem} requisições restantes hoje!")
         if r.status_code != 200:
-
+            print(f"  [API] {endpoint}: HTTP {r.status_code}")
             return [], budget
-
-        return r.json().get("response", []), budget
-
+        corpo = r.json()
+        # A API responde 200 mesmo com erro: o motivo vem no campo "errors"
+        erros = corpo.get("errors")
+        if erros:
+            _registrar_erro_api(endpoint, params, erros)
+            return [], budget
+        return corpo.get("response", []) or [], budget
     except Exception as e:
-
-        print(f"  [API] {e}")
-
+        print(f"  [API] {endpoint}: {type(e).__name__}")
         return [], budget
 
 
+# ── Jogos por data: UMA chamada traz todas as ligas do dia ──
 
-def buscar_jogos_copa(budget: dict):
+def _carregar_fixtures_cache() -> dict:
+    try:
+        if os.path.exists(ARQUIVO_FIXTURES):
+            with open(ARQUIVO_FIXTURES, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Erro em _carregar_fixtures_cache: {e}")
+    return {}
 
-    agora = datetime.now(timezone.utc)
 
-    dados, budget = api_get("fixtures", {
+def buscar_jogos_da_data(data_str: str, ttl_horas: float, budget: dict,
+                         dia_fechado: bool = False):
+    """Jogos das LIGAS numa data (UTC), com cache em disco.
 
-        "league": WORLD_CUP_ID, "season": WORLD_CUP_SEASON,
+    dia_fechado=True: data já passou; o cache só vale se foi feito depois
+    do fim do dia (senão os resultados finais ainda não estavam lá).
+    """
+    cache = _carregar_fixtures_cache()
+    item  = cache.get(data_str)
+    agora = time.time()
+    if item:
+        idade = agora - item.get("ts", 0)
+        if dia_fechado:
+            fim_dia = datetime.fromisoformat(data_str).replace(
+                tzinfo=timezone.utc).timestamp() + 86400 + 3 * 3600
+            if item.get("ts", 0) >= fim_dia and (item.get("jogos") or idade < 6 * 3600):
+                return item.get("jogos", []), budget
+        elif idade < ttl_horas * 3600:
+            return item.get("jogos", []), budget
+    dados, budget = api_get("fixtures", {"date": data_str}, budget)
+    jogos = [j for j in dados if j.get("league", {}).get("id") in LIGAS]
+    if not dados and item:
+        jogos = item.get("jogos", [])  # falhou: mantém o que já tinha
+    cache[data_str] = {"ts": agora, "jogos": jogos}
+    for k in sorted(cache)[:-5]:
+        cache.pop(k, None)
+    try:
+        _salvar_json(ARQUIVO_FIXTURES, cache)
+    except Exception as e:
+        print(f"Erro ao salvar cache de jogos: {e}")
+    return jogos, budget
 
-        "from": agora.strftime("%Y-%m-%d"),
 
-        "to": (agora + timedelta(hours=48)).strftime("%Y-%m-%d"),
+def _data_utc(jogo: dict):
+    try:
+        return datetime.fromisoformat(
+            jogo.get("fixture", {}).get("date", "").replace("Z", "+00:00"))
+    except Exception:
+        return None
 
-        "status": "NS",
 
-    }, budget)
+def buscar_jogos_proximos(budget: dict):
+    """Jogos ainda não iniciados nas próximas HORAS_ANTECEDENCIA horas."""
+    agora  = datetime.now(timezone.utc)
+    hoje   = agora.date()
+    j1, budget = buscar_jogos_da_data(hoje.isoformat(), 4, budget)
+    j2, budget = buscar_jogos_da_data((hoje + timedelta(days=1)).isoformat(), 8, budget)
+    limite = agora + timedelta(hours=HORAS_ANTECEDENCIA)
+    prioridade = {lid: i for i, lid in enumerate(LIGAS)}
+    proximos = []
+    for j in j1 + j2:
+        if j.get("fixture", {}).get("status", {}).get("short") != "NS":
+            continue
+        dt = _data_utc(j)
+        if dt and agora < dt <= limite:
+            proximos.append((dt, prioridade.get(j["league"]["id"], 99), j))
+    proximos.sort(key=lambda x: (x[0], x[1]))
+    return [x[2] for x in proximos], budget
 
+
+def buscar_jogos_finalizados(budget: dict):
+    """Resultados de ontem e hoje (para o backtest e para a força dos times)."""
+    hoje  = datetime.now(timezone.utc).date()
+    j_ont, budget = buscar_jogos_da_data(
+        (hoje - timedelta(days=1)).isoformat(), 0, budget, dia_fechado=True)
+    j_hoj, budget = buscar_jogos_da_data(hoje.isoformat(), 4, budget)
+    fim = ("FT", "AET", "PEN")
+    return [j for j in j_ont + j_hoj
+            if j.get("fixture", {}).get("status", {}).get("short") in fim], budget
+
+
+def buscar_ultimos_jogos(team_id: int, qtd: int, budget: dict):
+    # Todas as competições: um time na Champions também tem jogos na liga nacional
+    dados, budget = api_get("fixtures", {"team": team_id, "last": qtd}, budget)
     return dados or [], budget
-
-
-
-def buscar_jogos_finalizados_copa(budget: dict):
-
-    dados, budget = api_get("fixtures", {
-
-        "league": WORLD_CUP_ID, "season": WORLD_CUP_SEASON,
-
-        "status": "FT",
-
-    }, budget)
-
-    return dados or [], budget
-
-
-
-def buscar_classificacao_copa(budget: dict):
-
-    dados, budget = api_get("standings", {
-
-        "league": WORLD_CUP_ID, "season": WORLD_CUP_SEASON
-
-    }, budget)
-
-    if not dados: return {}, budget
-
-    
-
-    classificacao = {}
-
-    grupos = dados[0].get("league", {}).get("standings", [])
-
-    for grupo in grupos:
-
-        for t in grupo:
-
-            tid = t.get("team", {}).get("id")
-
-            classificacao[tid] = {
-
-                "points": t.get("points", 0),
-
-                "played": t.get("all", {}).get("played", 0),
-
-                "group": t.get("group", "")
-
-            }
-
-    return classificacao, budget
-
-
-
-def buscar_ultimos_jogos(team_id: int, qtd: int,
-
-                          league_id: int, season: int, budget: dict):
-
-    dados, budget = api_get("fixtures", {
-
-        "team": team_id, "last": qtd,
-
-        "league": league_id, "season": season,
-
-        "statistics": "true",
-
-    }, budget)
-
-    return dados or [], budget
-
 
 
 def buscar_h2h(id1: int, id2: int, qtd: int, budget: dict):
-
     dados, budget = api_get("fixtures/headtohead", {
-
         "h2h": f"{id1}-{id2}", "last": qtd,
-
-        "statistics": "true",
-
     }, budget)
-
     return dados or [], budget
-
-
-
-def obter_elo_ratings() -> dict:
-
-    try:
-
-        import requests
-
-        n_raw = requests.get('https://www.eloratings.net/en.teams.tsv', timeout=10).text
-
-        e_raw = requests.get('https://www.eloratings.net/World.tsv', timeout=10).text
-
-        names = {}
-
-        for line in n_raw.split('\n'):
-
-            parts = line.split('\t')
-
-            if len(parts) >= 2: names[parts[0]] = parts[1].strip()
-
-        elos = {}
-
-        for line in e_raw.split('\n'):
-
-            parts = line.split('\t')
-
-            if len(parts) >= 4:
-
-                code = parts[2]
-
-                score = int(parts[3])
-
-                if code in names: elos[names[code]] = score
-
-        return elos
-
-    except Exception as e:
-
-        print(f"Erro ao buscar Elo Ratings: {e}")
-
-        return {}
-
-
-
-def buscar_xg_jogo(fixture_id: int, budget: dict):
-
-    dados, budget = api_get("fixtures/statistics", {
-
-        "fixture": fixture_id,
-
-    }, budget)
-
-    return dados or [], budget
-
 
 
 def buscar_historico_completo(team_id: int, nome: str, budget: dict):
-
-    jogos = []
-
-    j, budget = buscar_ultimos_jogos(
-
-        team_id, JOGOS_HISTORICO, WORLD_CUP_ID, WORLD_CUP_SEASON, budget)
-
-    jogos.extend(j)
-
-    time.sleep(0.5)
-
-    if len(jogos) < 4:
-
-        for eid in ELIMINATORIAS_IDS[:2]:
-
-            if calls_disponiveis(budget) < 3:
-
-                break
-
-            j, budget = buscar_ultimos_jogos(
-
-                team_id, JOGOS_HISTORICO, eid, 2025, budget)
-
-            jogos.extend(j)
-
-            time.sleep(0.5)
-
-            if len(jogos) >= 5:
-
-                break
-
-    if len(jogos) < 4:
-
-        liga_id = LIGAS_NACIONAIS.get(nome)
-
-        if liga_id and calls_disponiveis(budget) >= 2:
-
-            j, budget = buscar_ultimos_jogos(
-
-                team_id, JOGOS_HISTORICO, liga_id, 2025, budget)
-
-            jogos.extend(j)
-
-            time.sleep(0.5)
-
+    jogos, budget = buscar_ultimos_jogos(team_id, JOGOS_HISTORICO, budget)
+    jogos = [j for j in jogos
+             if j.get("goals", {}).get("home") is not None
+             and j.get("goals", {}).get("away") is not None]
     print(f"    📋 {nome}: {len(jogos)} jogos | "
-
           f"peso recência ativo (λ={LAMBDA_DECAY}/dia)")
-
     return jogos, budget
 
+
+# ── Odds REAIS das casas (endpoint /odds) ──
+
+def _mapear_mercado(nome_aposta: str, valor: str):
+    if nome_aposta == "Match Winner":
+        return {"Home": "vitoria_casa", "Draw": "empate", "Away": "vitoria_fora"}.get(valor)
+    if nome_aposta == "Goals Over/Under":
+        return {"Over 2.5": "over25", "Under 2.5": "under25", "Over 1.5": "over15"}.get(valor)
+    if nome_aposta == "Both Teams Score":
+        return "btts" if valor == "Yes" else None
+    return None
+
+
+def buscar_odds_reais(fixture_id: int, budget: dict):
+    """Retorna {mercado: {casa: odd}} só com as casas de CASAS_VALUE."""
+    dados, budget = api_get("odds", {"fixture": fixture_id}, budget)
+    preferidas = {c.lower(): c for c in CASAS_VALUE}
+    odds = {}
+    for bloco in dados or []:
+        for bm in bloco.get("bookmakers", []):
+            casa = preferidas.get(str(bm.get("name", "")).lower())
+            if not casa:
+                continue
+            for aposta in bm.get("bets", []):
+                for v in aposta.get("values", []):
+                    chave = _mapear_mercado(aposta.get("name", ""), str(v.get("value", "")))
+                    if not chave:
+                        continue
+                    try:
+                        odd = float(v.get("odd"))
+                    except (TypeError, ValueError):
+                        continue
+                    if odd > 1.0:
+                        odds.setdefault(chave, {})[casa] = odd
+    return odds, budget
+
+
+def buscar_desfalques(fixture_id: int, budget: dict):
+    # /injuries tem dados ANTES do jogo; /fixtures/players só depois que acaba
+    dados, budget = api_get("injuries", {"fixture": fixture_id}, budget)
+    return dados or [], budget
 
 
 # ═══════════════════════════════════════════
@@ -1185,11 +1164,7 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
             f"   {'█' * round(rec['prob']/10)}{'░' * (10-round(rec['prob']/10))} {rec['prob']}%",
 
-            f"   Odd fair : {rec['odd_fair']}{push_txt}",
-
-            f"   Stake    : R${stake}",
-
-            f"   Retorno  : R${retorno}",
+            f"   Odd mínima p/ valer a pena: acima de {rec['odd_fair']}{push_txt}",
 
             "",
 
@@ -2191,6 +2166,8 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
     league = jogo.get("league",  {})
 
+    nome_liga = LIGAS.get(league.get("id"), league.get("name", ""))
+
     nc     = teams.get("home", {}).get("name", "?")
 
     nf     = teams.get("away", {}).get("name", "?")
@@ -2223,7 +2200,7 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
         "╔══════════════════════════════════╗",
 
-        "║       COPA DO MUNDO 2026         ║",
+        f"║ 🏆 {nome_liga[:29]:<29}║",
 
         f"║ ⚽ {nc[:14]:<14} vs {nf[:9]:<9}║",
 
@@ -2239,7 +2216,7 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
     if movimentos:
 
-        linhas += ["🚨 SMART MONEY DETECTADO", SEP_SLIM]
+        linhas += ["🔄 MUDANÇA NAS PROBABILIDADES DO MODELO", SEP_SLIM]
 
         for merc, mv in movimentos.items():
 
@@ -2249,35 +2226,18 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
     if mercados_ok:
 
-        linhas += [SEP, "🎯 APOSTAS RECOMENDADAS", SEP]
+        linhas += [SEP, "🎯 MERCADOS MAIS PROVÁVEIS (modelo)", SEP,
+                   "Só vale apostar se a odd da casa for MAIOR que a odd mínima."]
 
         for idx, m in enumerate(mercados_ok, 1):
 
-            odd_fair = round(100 / m["prob"], 2)
-
-            stake    = kelly_stake(m["prob"], odd_fair)
-
-            retorno  = round(stake * odd_fair, 2)
-
-            edge     = calcular_edge(m["prob"], odd_fair)
-
-            rank_tag = "🥇 #1 — MELHOR APOSTA" if idx == 1 else f"🏅 #{idx} — BOA APOSTA"
+            odd_min = round(100 / m["prob"], 2)
 
             linhas += [
-
-                "", rank_tag, m["label"],
-
+                "", f"#{idx} {m['label']}",
                 f"{barra(m['prob'])} {m['prob']}%",
-
                 f"Confiança: {nivel(m['prob'])}",
-
-                f"💰 Odd fair: {odd_fair}",
-
-                f"💵 Stake Kelly : R${stake}",
-
-                f"🎁 Retorno     : R${retorno}",
-
-                f"📊 Edge        : +{edge}%",
+                f"💰 Odd mínima: acima de {odd_min}",
 
             ]
 
@@ -2345,7 +2305,7 @@ def enviar_resumo_diario(jogos: list) -> None:
 
     SEP      = "━" * 34
 
-    linhas   = [f"☀️ BOM DIA! COPA 2026 — {data}", f"⚽ {len(jogos)} jogo(s) programado(s) hoje", SEP]
+    linhas   = [f"☀️ BOM DIA! BALERION — {data}", f"⚽ {len(jogos)} jogo(s) programado(s) hoje", SEP]
 
     for j in jogos:
 
@@ -2367,7 +2327,7 @@ def enviar_resumo_diario(jogos: list) -> None:
 
                    f"Taxa de acerto : {taxa}%", f"Indicações     : {acertos}/{total_log} certas"]
 
-    linhas += ["", SEP, "🔬 Motor: Poisson+MC+Dixon-Coles+Platt+HA v6.1", "Análises serão enviadas antes de cada jogo."]
+    linhas += ["", SEP, "🔬 Motor: Poisson+MC+Dixon-Coles+Platt+HA v7.0", "Análises serão enviadas antes de cada jogo."]
 
     enviar_telegram("\n".join(linhas))
 
@@ -2457,60 +2417,29 @@ def calcular_score_confianca(probs_cal, probs_poisson, probs_mc, mc_met, mf_met,
 
 # ═══════════════════════════════════════════
 
-def buscar_jogadores_jogo(fixture_id: int, budget: dict):
+def calcular_impacto_desfalques(lesoes: list, id_time: int) -> dict:
+    """Usa a resposta do endpoint /injuries.
 
-    dados, budget = api_get("fixtures/players", {"fixture": fixture_id}, budget)
-
-    return dados or [], budget
-
-
-
-def calcular_impacto_desfalques(jogadores: list, id_time: int) -> dict:
-
+    fator_ataque multiplica os gols DO time; fator_defesa multiplica os gols
+    do ADVERSÁRIO (defesa desfalcada → adversário marca mais, por isso > 1).
+    """
     ausentes = []
-
-    penalidade_ataque = penalidade_defesa = 0.0
-
-    STATUS_AUSENTE = ["injured","suspended","doubtful","missing","lesionado","suspenso"]
-
-    for bloco in jogadores:
-
-        if bloco.get("team", {}).get("id") != id_time: continue
-
-        for pd in bloco.get("players", []):
-
-            p      = pd.get("player", {})
-
-            stats  = pd.get("statistics", [{}])
-
-            status = str(p.get("reason", "")).lower()
-
-            pos    = stats[0].get("games", {}).get("position", "") if stats else ""
-
-            if not any(s in status for s in STATUS_AUSENTE): continue
-
-            nome = p.get("name", "Jogador desconhecido")
-
-            ausentes.append(f"{nome} ({pos})")
-
-            if pos in ("F","Attacker","Forward"):       penalidade_ataque += 0.13
-
-            elif pos in ("M","Midfielder"):             penalidade_ataque += 0.06; penalidade_defesa += 0.06
-
-            elif pos in ("D","Defender"):               penalidade_defesa += 0.10
-
-            elif pos in ("G","Goalkeeper"):             penalidade_defesa += 0.16
-
+    penalidade = 0.0
+    for item in lesoes:
+        if item.get("team", {}).get("id") != id_time:
+            continue
+        p      = item.get("player", {})
+        tipo   = str(p.get("type", "")).lower()
+        motivo = p.get("reason") or ""
+        nome   = p.get("name", "Jogador")
+        peso   = 0.5 if ("question" in tipo or "doubt" in tipo) else 1.0
+        ausentes.append(f"{nome} ({motivo})" if motivo else nome)
+        penalidade += 0.03 * peso
     return {
-
         "ausentes":       ausentes,
-
-        "fator_ataque":   round(max(0.55, 1.0 - penalidade_ataque), 3),
-
-        "fator_defesa":   round(max(0.55, 1.0 - penalidade_defesa), 3),
-
+        "fator_ataque":   round(max(0.80, 1.0 - penalidade), 3),
+        "fator_defesa":   round(min(1.20, 1.0 + penalidade * 0.7), 3),
         "total_ausentes": len(ausentes),
-
     }
 
 
@@ -2642,10 +2571,9 @@ def processar_backtest(log: list, jogos_finalizados: list) -> dict:
             "btts": gc > 0 and gf > 0, "over25": gc + gf > 2,
 
             "under25": gc + gf <= 2, "over15": gc + gf > 1,
-
-            "escanteios": True, "cartoes": True,
-
         }
+        # escanteios/cartões ficam de fora: não temos o resultado real deles
+        odds_reais = entrada.get("odds_reais", {}) or {}
 
         acertou_algum = False
 
@@ -2653,13 +2581,12 @@ def processar_backtest(log: list, jogos_finalizados: list) -> dict:
 
             if prob < PROB_MINIMA: continue
 
-            ocorreu  = reais.get(mercado, False)
-
-            odd_fair = round(100 / prob, 2) if prob > 0 else 2.0
-
+            ocorreu  = reais.get(mercado)
+            if ocorreu is None: continue
+            odd_real = odds_reais.get(mercado)
             stake    = 10.0
-
-            lucro    = round(stake * odd_fair - stake, 2) if ocorreu else -stake
+            # ROI só existe com a odd REAL registrada no alerta
+            lucro    = (round(stake * odd_real - stake, 2) if ocorreu else -stake) if odd_real else 0.0
 
             acertos_m[mercado] = acertos_m.get(mercado, 0) + (1 if ocorreu else 0)
 
@@ -2749,15 +2676,29 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
 
     for e in com_resultado:
 
+        try:
+            gc, gf = (int(x) for x in str(e.get("placar_real", "")).split("-"))
+        except ValueError:
+            continue
+
+        reais = {
+            "vitoria_casa": gc > gf, "empate": gc == gf, "vitoria_fora": gc < gf,
+            "btts": gc > 0 and gf > 0, "over25": gc + gf > 2,
+            "under25": gc + gf <= 2, "over15": gc + gf > 1,
+        }
+
+        odds_reais = e.get("odds_reais", {}) or {}
+
         for merc, prob in e.get("probs_calibradas", {}).items():
 
-            if prob < PROB_MINIMA: continue
+            if prob < PROB_MINIMA or merc not in reais: continue
 
-            ocorreu  = e.get("resultado") == "acerto"
+            ocorreu  = reais[merc]
 
-            odd_fair = round(100 / prob, 2) if prob > 0 else 2.0
+            odd_real = odds_reais.get(merc)
 
-            lucro    = round(10 * odd_fair - 10, 2) if ocorreu else -10.0
+            lucro    = ((round(10 * odd_real - 10, 2) if ocorreu else -10.0)
+                        if odd_real else 0.0)
 
             roi_semana[merc] = round(roi_semana.get(merc, 0) + lucro, 2)
 
@@ -2767,7 +2708,7 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
 
     data_str = agora_brt().strftime("%d/%m/%Y")
 
-    linhas   = [f"📊 RELATÓRIO SEMANAL — Copa 2026", f"📅 {data_str}", "",
+    linhas   = [f"📊 RELATÓRIO SEMANAL — Balerion", f"📅 {data_str}", "",
 
                 "─" * 34, "📈 DESEMPENHO DA SEMANA", "─" * 34,
 
@@ -2799,7 +2740,7 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
 
             linhas += [f"⚽ {nc} vs {nf}", f"   {hora} | {rod}"]
 
-    linhas += ["", "━" * 34, "🔬 Motor: Poisson+MC+Dixon-Coles+Platt+HA v6.1"]
+    linhas += ["", "━" * 34, "🔬 Motor: Poisson+MC+Dixon-Coles+Platt+HA v7.0"]
 
     return "\n".join(linhas)
 
@@ -3110,7 +3051,7 @@ print(f"✅ Parâmetros calibrados para {len(PLATT_PARAMS)} mercados")
 
 # ═══════════════════════════════════════════
 
-def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list, elo_ratings: dict = None, classificacao: dict = None) -> tuple:
+def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list) -> tuple:
 
     fix      = jogo.get("fixture", {})
 
@@ -3144,11 +3085,13 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list,
 
     print(f"\n  ⚽ {nc} vs {nf} [{fase.replace('_',' ').title()}]")
 
-    if calls_disponiveis(budget) < 6:
+    if calls_disponiveis(budget) < CALLS_POR_JOGO + BUDGET_EMERGENCIA:
 
         print("  ⚠️  Budget insuficiente.")
 
         return budget, cache
+
+    print(f"    🏆 {LIGAS.get(league.get('id'), league.get('name', ''))}")
 
     jogos_c, budget = buscar_historico_completo(id_c, nc, budget)
 
@@ -3186,57 +3129,11 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list,
 
     dias_f = calcular_dias_descanso(jogos_f, data_jogo)
 
-    forcas  = calcular_forca_times(todos_jogos_copa + jogos_c + jogos_f)
+    forcas  = calcular_forca_times(jogos_finalizados + jogos_c + jogos_f)
 
     forca_c = forcas.get(id_c, {"alpha": 1.0, "beta": 1.0})
 
     forca_f = forcas.get(id_f, {"alpha": 1.0, "beta": 1.0})
-
-
-
-    elo_ratings = elo_ratings or {}
-
-    elo_c = elo_ratings.get(nc)
-
-    elo_f = elo_ratings.get(nf)
-
-    
-
-    if elo_c:
-
-        elo_ratio_c = elo_c / 1500.0
-
-        forca_c["alpha"] = round(forca_c["alpha"] * 0.6 + elo_ratio_c * 0.4, 3)
-
-        forca_c["beta"]  = round(forca_c["beta"] * 0.6 + (1 / elo_ratio_c) * 0.4, 3)
-
-        
-
-    if elo_f:
-
-        elo_ratio_f = elo_f / 1500.0
-
-        forca_f["alpha"] = round(forca_f["alpha"] * 0.6 + elo_ratio_f * 0.4, 3)
-
-        forca_f["beta"]  = round(forca_f["beta"] * 0.6 + (1 / elo_ratio_f) * 0.4, 3)
-
-
-
-    if fase == "fase_grupos" and classificacao:
-
-        dados_c = classificacao.get(id_c)
-
-        dados_f = classificacao.get(id_f)
-
-        if dados_c and dados_f and dados_c["played"] == 2 and dados_f["played"] == 2:
-
-            if dados_c["points"] >= 4 and dados_f["points"] >= 4:
-
-                print("  🤝 ALERTA: Efeito 'Disgrace of Gijón' (Ambos jogam pelo empate)!")
-
-                forca_c["alpha"] *= 0.4
-
-                forca_f["alpha"] *= 0.4
 
 
 
@@ -3284,15 +3181,15 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list,
 
     desf_f = {"ausentes": [], "fator_ataque": 1.0, "fator_defesa": 1.0, "total_ausentes": 0}
 
-    if calls_disponiveis(budget) >= 2:
+    if calls_disponiveis(budget) >= 2 + BUDGET_EMERGENCIA:
 
-        jogadores_jogo, budget = buscar_jogadores_jogo(int(fid), budget)
+        lesoes, budget = buscar_desfalques(int(fid), budget)
 
-        if jogadores_jogo:
+        if lesoes:
 
-            desf_c = calcular_impacto_desfalques(jogadores_jogo, id_c)
+            desf_c = calcular_impacto_desfalques(lesoes, id_c)
 
-            desf_f = calcular_impacto_desfalques(jogadores_jogo, id_f)
+            desf_f = calcular_impacto_desfalques(lesoes, id_f)
 
             if desf_c["total_ausentes"] > 0 or desf_f["total_ausentes"] > 0:
 
@@ -3302,7 +3199,7 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list,
 
                 if lc_adj != lc or lf_adj != lf:
 
-                    print(f"    🔧 Ajuste lesões: λc {lc}→{lc_adj} λf {lf}→{lf_adj}")
+                    print(f"    🔧 Ajuste desfalques: λc {lc}→{lc_adj} λf {lf}→{lf_adj}")
 
                     placares2  = matriz_placares(lc_adj, lf_adj)
 
@@ -3318,27 +3215,22 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list,
 
                     lc, lf = lc_adj, lf_adj
 
-    odds_casas_ref = {}
+    # Odds REAIS das casas. Sem odd real não existe value bet: nada é estimado.
+    odds_reais, budget = buscar_odds_reais(int(fid), budget)
 
-    for k, prob in probs_cal.items():
+    value_bets = calcular_value_bets(probs_cal, odds_reais) if odds_reais else []
 
-        if prob > 0:
+    if odds_reais:
 
-            odd_fair = round(100 / prob, 2)
+        bloco_vb = montar_bloco_value_bets(value_bets) or (
+            "\n" + "━" * 34 + "\n💎 Odds reais conferidas: nenhuma value bet acima de 3%.")
 
-            odds_casas_ref[k] = {
+    else:
 
-                "Bet365": round(odd_fair * 1.02, 2), "Pinnacle": round(odd_fair * 1.04, 2),
+        bloco_vb = ("\n" + "━" * 34 + "\n💎 Sem odds reais das casas para este jogo "
+                    "— value bet não calculada.")
 
-                "Betano": round(odd_fair * 0.97, 2), "Betfair": round(odd_fair * 1.03, 2),
-
-                "Sportingbet": round(odd_fair * 0.96, 2),
-
-            }
-
-    value_bets = calcular_value_bets(probs_cal, odds_casas_ref)
-
-    bloco_vb   = montar_bloco_value_bets(value_bets)
+    melhor_odd = {m: max(c.values()) for m, c in odds_reais.items() if c}
 
     alerta = montar_alerta(
 
@@ -3396,6 +3288,10 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, todos_jogos_copa: list,
 
             "value_bets": [v["mercado"] for v in value_bets[:3]],
 
+            "liga": LIGAS.get(jogo.get("league", {}).get("id"), ""),
+
+            "odds_reais": melhor_odd,
+
             "line_movement": movimentos, "resultado": None, "placar_real": None,
 
         })
@@ -3436,27 +3332,29 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     print(f"\n{'═'*58}")
 
-    print(f"  🤖 Predictor v6.1 | {agora}")
+    print(f"  🤖 Balerion v7.0 | {agora}")
 
     print(f"  📊 Budget: {budget['calls_usadas']}/{BUDGET_DIARIO} | {disponi} disponíveis")
 
     print(f"{'═'*58}")
 
-    if disponi < 6:
+    if disponi <= BUDGET_EMERGENCIA:
 
-        print("  ⚠️  Budget insuficiente.")
-
-        return budget, cache, params_modelo
-
-    jogos, budget = buscar_jogos_copa(budget)
-
-    if not jogos:
-
-        print("  Nenhum jogo nas próximas 48h.")
+        print("  ⚠️  Budget do dia esgotado.")
 
         return budget, cache, params_modelo
 
-    print(f"  ⚽ {len(jogos)} jogo(s)")
+    jogos, budget = buscar_jogos_proximos(budget)
+
+    finalizados, budget = buscar_jogos_finalizados(budget)
+
+    if jogos:
+
+        print(f"  ⚽ {len(jogos)} jogo(s) nas próximas {HORAS_ANTECEDENCIA}h")
+
+    else:
+
+        print(f"  Nenhum jogo das ligas monitoradas nas próximas {HORAS_ANTECEDENCIA}h.")
 
     hoje = agora_brt().strftime("%Y-%m-%d")
 
@@ -3468,37 +3366,19 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
         resumo_hoje = hoje
 
-    todos_copa, budget = buscar_jogos_finalizados_copa(budget)
-
-    todos_copa = todos_copa or []
-
-    elo_ratings = obter_elo_ratings()
-
-    if elo_ratings:
-
-        print(f"  📈 Elo Ratings: carregados para {len(elo_ratings)} seleções")
-
-    classificacao, budget = buscar_classificacao_copa(budget)
-
-    if classificacao:
-
-        print("  📊 Classificação da Copa carregada.")
-
     for jogo in jogos:
 
-        if calls_disponiveis(budget) < 6:
+        if calls_disponiveis(budget) < CALLS_POR_JOGO + BUDGET_EMERGENCIA:
 
-            print("  ⚠️  Budget esgotado.")
+            print("  ⚠️  Budget esgotado — restante fica para amanhã.")
 
             break
 
-        budget, cache = analisar_jogo(jogo, budget, cache, todos_copa, elo_ratings, classificacao)
-
-        time.sleep(2)
+        budget, cache = analisar_jogo(jogo, budget, cache, finalizados)
 
     log_atual = carregar_log()
 
-    bt        = processar_backtest(log_atual, todos_copa)
+    bt        = processar_backtest(log_atual, finalizados)
 
     if bt["atualizados"] > 0:
 
@@ -3508,9 +3388,7 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
         try:
 
-            with open(ARQUIVO_LOG, "w") as f:
-
-                json.dump(log_atual[-500:], f, ensure_ascii=False, indent=2)
+            _salvar_json(ARQUIVO_LOG, log_atual[-500:], indent=2)
 
         except Exception as e:
 
@@ -3560,7 +3438,7 @@ if __name__ == "__main__":
 
     print("╔══════════════════════════════════════════════════════╗")
 
-    print("║    TERRORNEGRO PREDICTOR v6.1 — COPA 2026          ║")
+    print("║    BALERION PREDICTOR v7.0 — LIGAS                 ║")
 
     print("╠══════════════════════════════════════════════════════╣")
 
@@ -3576,7 +3454,7 @@ if __name__ == "__main__":
 
     print("║  [6]  Poisson escanteios e cartões                 ║")
 
-    print("║  [7]  Line movement (smart money)                  ║")
+    print("║  [7]  Variação das probabilidades do modelo        ║")
 
     print("║  [8]  Ensemble: Poisson 60% + MC 40% + H2H        ║")
 
@@ -3584,7 +3462,7 @@ if __name__ == "__main__":
 
     print("║  [10] Lesões e desfalques                          ║")
 
-    print("║  [11] Value Bet multi-casa                         ║")
+    print("║  [11] Value Bet com odds REAIS das casas           ║")
 
     print("║  [12] Backtest automático                          ║")
 
@@ -3624,7 +3502,7 @@ if __name__ == "__main__":
 
         enviar_telegram(
 
-        "🤖 TERRORNEGRO PREDICTOR v6.1 ONLINE\n🏆 Copa do Mundo 2026\n\n"
+        "🤖 BALERION PREDICTOR v7.0 ONLINE\n🏆 " + ", ".join(LIGAS.values()) + "\n\n"
 
         "🔬 Motor completo ativo:\n  ✅  Poisson + Dixon-Coles\n"
 
@@ -3632,7 +3510,7 @@ if __name__ == "__main__":
 
         "  🎯 Platt Scaling calibrado\n  💤 Fator descanso entre jogos\n"
 
-        "  🚩 Poisson dedicado escanteios\n  🚨 Detecção smart money\n"
+        "  🚩 Poisson dedicado escanteios\n  🔄 Variação do modelo\n"
 
         "  🔀 Ensemble 8 módulos\n  📊 Score de confiança 0-100\n"
 
@@ -3640,7 +3518,7 @@ if __name__ == "__main__":
 
         "  📋 Backtest automático\n  📅 Relatório semanal\n"
 
-        "  🧠 Autoaprendizado\n  🎲 HANDICAP ASIÁTICO ← NOVO\n\n"
+        "  🧠 Autoaprendizado\n  🎲 Handicap asiático\n\n"
 
         f"  Prob ≥ {PROB_MINIMA}% | Kelly {int(KELLY_FRACAO*100)}% | BRT"
 

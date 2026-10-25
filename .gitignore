@@ -26,6 +26,7 @@ predictor_log.json
 odds_snapshot.json
 relatorio_semanal.json
 modelo_params.json
+fixtures_cache.json
 
 # Rascunhos descartaveis
 fixer.py
