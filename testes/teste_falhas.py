@@ -43,6 +43,15 @@ def fake_get(url, headers=None, params=None, timeout=None):
         return R([], status=500)
     if MODO["falha"] == "plano":
         return R([], errors={"plan": "Free plans do not have access to this season, try from 2022 to 2024."})
+    if ep == "fixtures" and "ids" in p:
+        if MODO.get("ids_falha"):
+            return R([])
+        out = []
+        for f in str(p["ids"]).split("-"):
+            out.append({"fixture": {"id": int(f)}, "teams": {"home": {"id": 1}, "away": {"id": 2}},
+                        "statistics": [{"team": {"id": 1}, "statistics": [{"type": "Shots on Goal", "value": 5}, {"type": "Corner Kicks", "value": 6}]},
+                                       {"team": {"id": 2}, "statistics": [{"type": "Shots on Goal", "value": 3}, {"type": "Corner Kicks", "value": 4}]}]})
+        return R(out)
     if ep == "fixtures" and "date" in p:
         if p["date"] == HOJE:
             js = [fx(100 + i, [71, 2, 39, 13][i % 4], 10 + 2 * i, 11 + 2 * i,
@@ -178,5 +187,24 @@ fora05 = pr.calcular_handicap_asiatico(pl, -0.5)["prob_fora"]   # visitante +0.5
 check(abs(fora05 - P(lambda a, b2: a <= b2)) < 0.01, f"AH Fora +0.5 = empate ou vitória fora ({fora05}%)")
 rec = ha["recomendada"]
 check(rec and pr.PROB_MINIMA <= rec["prob"] <= 80, f"recomendada útil: {rec and rec['label']} {rec and rec['prob']}% odd mín {rec and rec['odd_fair']}")
+
+print("\n### 10. Estatísticas em lote: cache e espera de 6h depois de falha")
+for f in os.listdir(DATA):
+    os.remove(os.path.join(DATA, f))
+pr._estats["dados"] = None
+chamadas.clear(); MODO["n_jogos"] = 2; MODO["remaining"] = 100; MODO["ids_falha"] = True
+b, c, prm = ciclo({"data": pr.hoje_utc(), "calls_usadas": 0}, {}, prm)
+n1 = len([1 for e, q in chamadas if e == "fixtures" and "ids" in q])
+b, c, prm = ciclo(b, {}, prm)
+n2 = len([1 for e, q in chamadas if e == "fixtures" and "ids" in q]) - n1
+check(n1 > 0 and n2 == 0, f"falha de estatística não é repetida a cada ciclo (1º ciclo {n1} lotes, 2º ciclo {n2})")
+MODO["ids_falha"] = False
+for f in os.listdir(DATA):
+    os.remove(os.path.join(DATA, f))
+pr._estats["dados"] = None; chamadas.clear()
+b, c, prm = ciclo({"data": pr.hoje_utc(), "calls_usadas": 0}, {}, prm)
+lotes = [q["ids"].count("-") + 1 for e, q in chamadas if e == "fixtures" and "ids" in q]
+check(lotes and max(lotes) <= 20, f"lotes de até 20 jogos por chamada: {lotes}")
+check(len(pr._cache_estats()) > 0 and any(not v.get("vazio") for v in pr._cache_estats().values()), "estatísticas guardadas em cache")
 
 print("\n" + ("TUDO OK" if not falhas else f"{len(falhas)} FALHA(S): {falhas}"))

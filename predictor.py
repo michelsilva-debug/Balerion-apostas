@@ -20,6 +20,8 @@ import math
 
 import random
 
+import re
+
 from datetime import datetime, timezone, timedelta
 
 from collections import defaultdict
@@ -109,13 +111,13 @@ VALUE_MINIMO         = 0.03
 # Teto de stake por aposta (fração da banca)
 STAKE_MAXIMO         = 0.02
 
-JOGOS_HISTORICO      = 10
+JOGOS_HISTORICO      = 20
 
 JOGOS_H2H            = 6
 
 MONTE_CARLO_N        = 100_000
 
-LAMBDA_DECAY         = 0.04
+LAMBDA_DECAY         = 0.01
 
 BUDGET_DIARIO        = int(os.getenv("BUDGET_DIARIO", "90"))  # plano grátis = 100/dia
 
@@ -145,6 +147,8 @@ ARQUIVO_PARAMS       = os.path.join(DATA_DIR, "modelo_params.json")
 
 ARQUIVO_FIXTURES     = os.path.join(DATA_DIR, "fixtures_cache.json")
 
+ARQUIVO_ESTATS       = os.path.join(DATA_DIR, "estatisticas_cache.json")
+
 JOGOS_PARA_RETREINAR = 5
 
 # Casas usadas nas value bets (só odds REAIS dessas casas entram no cálculo).
@@ -171,7 +175,21 @@ LIGAS = {
 HORAS_ANTECEDENCIA = 24
 
 # Chamadas por jogo analisado: histórico casa, histórico fora, H2H, odds, desfalques
-CALLS_POR_JOGO = 5
+CALLS_POR_JOGO = 7   # + até 2 lotes de estatísticas (chutes/escanteios)
+
+# Estratégia em teste: handicap asiático do VISITANTE com EV > 8%.
+# Backtest com odds reais da Bet365 (7 ligas): treino +4,7%, prova +4,8%
+# (apostar em todo AH visitante sem modelo: -0,3% / +0,7%). Ainda não comprovado.
+AH_VISITANTE_EV_MIN = 0.08
+
+# Escanteios (validado: calibrado, ganho pequeno sobre a média da liga)
+ESC_DECAY        = 0.003
+ESC_ENCOLHIMENTO = 30.0
+ESC_DISPERSAO    = 30.0     # binomial negativa (escanteios variam mais que Poisson)
+ESC_MIN_JOGOS    = 5
+LINHAS_ESC       = (8.5, 9.5, 10.5)
+MEDIA_ESC_CASA_PADRAO = 5.4
+MEDIA_ESC_FORA_PADRAO = 4.4
 
 
 
@@ -252,6 +270,8 @@ PRESSAO_FASE = {
 }
 
 LABELS = {
+    **{f"esc_over_{l}":  f"🚩 Escanteios +{l}" for l in (8.5, 9.5, 10.5)},
+    **{f"esc_under_{l}": f"🚩 Escanteios -{l}" for l in (8.5, 9.5, 10.5)},
 
     "vitoria_casa":  "⚽ Vitória da Casa",
 
@@ -844,8 +864,18 @@ def _mapear_mercado(nome_aposta: str, valor: str):
     return None
 
 
+_RE_AH  = re.compile(r"^(home|away)\s*([+-]?\d+(?:\.\d+)?)$", re.I)
+_RE_OU  = re.compile(r"^(over|under)\s*(\d+(?:\.\d+)?)$", re.I)
+_PARCIAL = ("1st", "2nd", "first", "second", "half", "team", "home ", "away ", "minute", "asian corner")
+
+
 def buscar_odds_reais(fixture_id: int, budget: dict):
-    """Retorna {mercado: {casa: odd}} só com as casas de CASAS_VALUE."""
+    """{chave: {casa: odd}} só com as casas de CASAS_VALUE.
+
+    Chaves: vitoria_casa/empate/vitoria_fora, over25/under25/over15, btts,
+    "ah_casa@-0.75" / "ah_fora@+0.75" (linha do PRÓPRIO time),
+    "esc_over_9.5" / "esc_under_9.5".
+    """
     dados, budget = api_get("odds", {"fixture": fixture_id}, budget)
     preferidas = {c.lower(): c for c in CASAS_VALUE}
     odds = {}
@@ -855,17 +885,137 @@ def buscar_odds_reais(fixture_id: int, budget: dict):
             if not casa:
                 continue
             for aposta in bm.get("bets", []):
+                nome = str(aposta.get("name", ""))
+                baixo = nome.lower()
+                valores = []
                 for v in aposta.get("values", []):
-                    chave = _mapear_mercado(aposta.get("name", ""), str(v.get("value", "")))
-                    if not chave:
-                        continue
                     try:
                         odd = float(v.get("odd"))
                     except (TypeError, ValueError):
                         continue
                     if odd > 1.0:
+                        valores.append((str(v.get("value", "")).strip(), odd))
+                if baixo == "asian handicap":
+                    for chave, odd in _chaves_ah(valores):
                         odds.setdefault(chave, {})[casa] = odd
+                elif "corner" in baixo and not any(p in baixo for p in _PARCIAL):
+                    for val, odd in valores:
+                        m = _RE_OU.match(val)
+                        if m and float(m.group(2)) in LINHAS_ESC:
+                            odds.setdefault(f"esc_{m.group(1).lower()}_{float(m.group(2))}", {})[casa] = odd
+                else:
+                    for val, odd in valores:
+                        chave = _mapear_mercado(nome, val)
+                        if chave:
+                            odds.setdefault(chave, {})[casa] = odd
     return odds, budget
+
+
+def _chaves_ah(valores: list) -> list:
+    """Converte "Home -1" / "Away +1" para a linha de cada time.
+
+    Algumas casas escrevem o visitante com a linha dele ("Away +1") e outras
+    com a linha do mandante ("Away -1"). Descobre a convenção pelos pares.
+    """
+    casa, fora = [], []
+    for val, odd in valores:
+        m = _RE_AH.match(val)
+        if m:
+            (casa if m.group(1).lower() == "home" else fora).append((float(m.group(2)), odd))
+    linhas_casa = {l for l, _ in casa}
+    propria = sum(1 for l, _ in fora if -l in linhas_casa)
+    do_mandante = sum(1 for l, _ in fora if l in linhas_casa and l != 0)
+    sinal = -1 if do_mandante > propria else 1
+    out = [(f"ah_casa@{l:+.2f}", o) for l, o in casa]
+    out += [(f"ah_fora@{sinal * l:+.2f}", o) for l, o in fora]
+    return out
+
+
+_estats = {"dados": None}
+
+
+def _cache_estats() -> dict:
+    if _estats["dados"] is None:
+        try:
+            with open(ARQUIVO_ESTATS, encoding="utf-8") as f:
+                _estats["dados"] = json.load(f)
+        except Exception:
+            _estats["dados"] = {}
+    return _estats["dados"]
+
+
+def _salvar_estats() -> None:
+    c = _cache_estats()
+    if len(c) > 4000:                      # guarda só os mais recentes
+        for k in list(c)[:-4000]:
+            c.pop(k, None)
+    try:
+        _salvar_json(ARQUIVO_ESTATS, c)
+    except Exception as e:
+        print(f"Erro ao salvar estatísticas: {e}")
+
+
+def extrair_estats_api(item: dict):
+    """{"h": {"sot", "esc"}, "a": {...}} a partir de um fixture com "statistics"."""
+    ids = {item.get("teams", {}).get("home", {}).get("id"): "h",
+           item.get("teams", {}).get("away", {}).get("id"): "a"}
+    out = {}
+    for bloco in item.get("statistics") or []:
+        lado = ids.get(bloco.get("team", {}).get("id"))
+        if not lado:
+            continue
+        v = {}
+        for s in bloco.get("statistics", []):
+            tipo, val = str(s.get("type", "")).lower(), s.get("value")
+            try:
+                val = int(val) if val is not None else None
+            except (TypeError, ValueError):
+                val = None
+            if tipo == "shots on goal": v["sot"] = val
+            elif tipo == "corner kicks": v["esc"] = val
+        out[lado] = v
+    return out if "h" in out and "a" in out else None
+
+
+def buscar_estatisticas(fids: list, budget: dict, max_lotes: int = 2):
+    """Busca chutes/escanteios de até 20 jogos por chamada (fixtures?ids=)."""
+    cache = _cache_estats()
+    agora = time.time()
+    # falha anterior só é tentada de novo depois de 6h (não queima cota a cada ciclo)
+    faltam = [str(f) for f in dict.fromkeys(fids) if f and (
+        str(f) not in cache or agora - cache[str(f)].get("falha", agora) > 6 * 3600)]
+    lotes = 0
+    for i in range(0, len(faltam), 20):
+        if lotes >= max_lotes or calls_disponiveis(budget) <= BUDGET_EMERGENCIA + 2:
+            break
+        lote = faltam[i:i + 20]
+        dados, budget = api_get("fixtures", {"ids": "-".join(lote)}, budget)
+        lotes += 1
+        if not dados:
+            for fid in lote:              # falha: tenta de novo daqui a 6h
+                cache[fid] = {"falha": agora, "vazio": True}
+            continue
+        for item in dados:
+            fid = str(item.get("fixture", {}).get("id", ""))
+            cache[fid] = extrair_estats_api(item) or {"vazio": True}
+        for fid in lote:
+            cache.setdefault(fid, {"vazio": True})
+    if lotes:
+        _salvar_estats()
+    return budget
+
+
+def anexar_estats(jogos: list) -> list:
+    cache = _cache_estats()
+    for j in jogos:
+        e = cache.get(str(j.get("fixture", {}).get("id", "")))
+        if e and not e.get("vazio"):
+            j["estat"] = e
+    return jogos
+
+
+def _estat(j: dict, lado: str, campo: str):
+    return ((j.get("estat") or {}).get(lado) or {}).get(campo)
 
 
 def buscar_desfalques(fixture_id: int, budget: dict):
@@ -1664,7 +1814,9 @@ MEDIA_GOLS_CASA_PADRAO = 1.50
 MEDIA_GOLS_FORA_PADRAO = 1.20
 # Quantos "jogos fictícios na média" puxam a força estimada para 1.0.
 # Com só 10 jogos por time, sem isso o modelo exagera (testado em 3.900 jogos reais).
-ENCOLHIMENTO_JOGOS     = 16.0
+ENCOLHIMENTO_JOGOS     = 8.0
+# Peso dos gols reais x "gols pelos chutes no alvo" (chute no alvo x conversão da liga)
+PESO_GOLS              = 0.5
 
 
 def medias_de_gols(finalizados: list) -> tuple:
@@ -1681,10 +1833,66 @@ def medias_de_gols(finalizados: list) -> tuple:
     return round(mh, 3), round(ma, 3)
 
 
-def calcular_forca_time(jogos: list, team_id: int, media_geral: float) -> dict:
+def medias_estatisticas(jogos: list) -> dict:
+    """Conversão gols/chute no alvo e média de escanteios (mandante/visitante)."""
+    vistos = set(); g = sot = 0.0; ec = ef = ne = 0
+    for j in jogos:
+        fid = j.get("fixture", {}).get("id")
+        if fid in vistos or "estat" not in j:
+            continue
+        vistos.add(fid)
+        gl = j.get("goals", {})
+        sh, sa = _estat(j, "h", "sot"), _estat(j, "a", "sot")
+        if sh is not None and sa is not None and gl.get("home") is not None and gl.get("away") is not None:
+            g += int(gl["home"]) + int(gl["away"]); sot += sh + sa
+        ch, ca = _estat(j, "h", "esc"), _estat(j, "a", "esc")
+        if ch is not None and ca is not None:
+            ec += ch; ef += ca; ne += 1
+    return {
+        "conv": (g + 30 * 0.32 * 9) / (sot + 30 * 9),
+        "esc_casa": (ec + 30 * MEDIA_ESC_CASA_PADRAO) / (ne + 30),
+        "esc_fora": (ef + 30 * MEDIA_ESC_FORA_PADRAO) / (ne + 30),
+    }
+
+
+def calcular_forca_escanteios(jogos: list, team_id: int, media: float) -> dict:
+    a = d = peso = 0.0; n = 0
+    for j in jogos:
+        eh_casa = j.get("teams", {}).get("home", {}).get("id") == team_id
+        cp = _estat(j, "h" if eh_casa else "a", "esc")
+        cs = _estat(j, "a" if eh_casa else "h", "esc")
+        if cp is None or cs is None:
+            continue
+        w = math.exp(-ESC_DECAY * dias_atras(j.get("fixture", {}).get("date", "")))
+        a += cp * w; d += cs * w; peso += w; n += 1
+    if n == 0 or peso == 0:
+        return {"ataque": 1.0, "cede": 1.0, "jogos": 0}
+    k = ESC_ENCOLHIMENTO
+    return {"ataque": round((n * (a / peso) / media + k) / (n + k), 3),
+            "cede":   round((n * (d / peso) / media + k) / (n + k), 3), "jogos": n}
+
+
+def _prob_total_nb(lam: float, k: int) -> float:
+    r = ESC_DISPERSAO
+    p = r / (r + lam)
+    return math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1)
+                    + r * math.log(p) + k * math.log(1 - p))
+
+
+def prob_escanteios(lam: float) -> dict:
+    """{"esc_over_9.5": %, "esc_under_9.5": %, ...} pela binomial negativa."""
+    out = {}
+    for linha in LINHAS_ESC:
+        over = 1 - sum(_prob_total_nb(lam, k) for k in range(int(linha) + 1))
+        out[f"esc_over_{linha}"]  = round(over * 100, 2)
+        out[f"esc_under_{linha}"] = round(100 - over * 100, 2)
+    return out
+
+
+def calcular_forca_time(jogos: list, team_id: int, media_geral: float, conv: float = None) -> dict:
     """alpha = força de ataque, beta = fragilidade defensiva (1.0 = time médio)."""
     marc = sofr = peso = 0.0
-    n = 0
+    n = chutes = 0
     for j in jogos:
         teams, goals = j.get("teams", {}), j.get("goals", {})
         if goals.get("home") is None or goals.get("away") is None:
@@ -1692,6 +1900,13 @@ def calcular_forca_time(jogos: list, team_id: int, media_geral: float) -> dict:
         eh_casa = teams.get("home", {}).get("id") == team_id
         gp = int(goals["home"] if eh_casa else goals["away"])
         gs = int(goals["away"] if eh_casa else goals["home"])
+        sp = _estat(j, "h" if eh_casa else "a", "sot")
+        ss = _estat(j, "a" if eh_casa else "h", "sot")
+        if conv and sp is not None and ss is not None:
+            # chute no alvo é sinal mais estável que gol (testado em 9.390 jogos)
+            gp = PESO_GOLS * gp + (1 - PESO_GOLS) * sp * conv
+            gs = PESO_GOLS * gs + (1 - PESO_GOLS) * ss * conv
+            chutes += 1
         w = peso_temporal(j.get("fixture", {}).get("date", ""))
         marc += gp * w; sofr += gs * w; peso += w; n += 1
     if n == 0 or peso == 0 or media_geral <= 0:
@@ -1701,7 +1916,7 @@ def calcular_forca_time(jogos: list, team_id: int, media_geral: float) -> dict:
     b_bruto = (sofr / peso) / media_geral
     return {"alpha": round((n * a_bruto + k) / (n + k), 3),
             "beta":  round((n * b_bruto + k) / (n + k), 3),
-            "jogos": n}
+            "jogos": n, "com_chutes": chutes}
 
 
 
@@ -1980,7 +2195,8 @@ def aplicar_platt_todos(probs: dict, platt_params: dict) -> dict:
 
 # ═══════════════════════════════════════════
 
-def lucro_aposta(mercado: str, gc: int, gf: int, odd: float, linha: float = None) -> float:
+def lucro_aposta(mercado: str, gc: int, gf: int, odd: float, linha: float = None,
+                 escanteios: int = None) -> float:
     """Lucro por R$1 apostado, pelo placar de 90 min. Devolução (push) = 0.
 
     Handicap asiático: "ah_casa"/"ah_fora" com a linha DO PRÓPRIO time.
@@ -1995,6 +2211,13 @@ def lucro_aposta(mercado: str, gc: int, gf: int, odd: float, linha: float = None
             r = dif + l
             total += (odd - 1) if r > 0 else (-1.0 if r < 0 else 0.0)
         return round(total / len(partes), 4)
+    if mercado.startswith("esc_"):
+        if escanteios is None:
+            raise ValueError("sem total de escanteios para liquidar")
+        partes = mercado.split("_")            # esc_over / esc_over_9.5
+        l = float(partes[2]) if len(partes) > 2 else linha
+        ganhou = escanteios > l if partes[1] == "over" else escanteios < l
+        return round(odd - 1, 4) if ganhou else -1.0
     ganhou = {
         "vitoria_casa": gc > gf, "empate": gc == gf, "vitoria_fora": gc < gf,
         "btts": gc > 0 and gf > 0, "over25": gc + gf > 2,
@@ -2101,7 +2324,7 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
         return ""
 
-    xg_tag  = "✅ xG" if tem_xg else "⚠️  gols brutos"
+    xg_tag  = "✅ gols + chutes no alvo" if tem_xg else "⚠️ só gols (chutes ainda sem histórico)"
 
     SEP      = "━" * 34
 
@@ -2294,7 +2517,7 @@ def calcular_score_confianca(probs_cal, probs_poisson, probs_mc, mc_met, mf_met,
 
     score   += pts_xg
 
-    detalhes.append(f"xG: +{pts_xg}pts ({'disponível ✅' if tem_xg else 'usando gols ⚠️'})")
+    detalhes.append(f"Chutes no alvo: +{pts_xg}pts ({'disponível ✅' if tem_xg else 'só gols ⚠️'})")
 
     fd_c     = min(dias_c, 7) / 7
 
@@ -2375,38 +2598,77 @@ def calcular_impacto_desfalques(lesoes: list, id_time: int) -> dict:
 
 # ═══════════════════════════════════════════
 
-def calcular_value_bets(probs_cal: dict, odds_casas: dict) -> list:
-    """Divergências modelo x casa: melhor odd de cada mercado com EV > VALUE_MINIMO."""
+def calcular_value_bets(probs_cal: dict, odds_casas: dict, placares: list = None) -> list:
+    """Divergências modelo x casa (melhor odd de cada mercado com EV > VALUE_MINIMO).
+
+    Handicap asiático usa o EV exato da matriz de placares (inclui meia vitória,
+    devolução etc). Marca a estratégia em teste: AH visitante com EV > 8%.
+    """
     values = []
-    for mercado, prob in probs_cal.items():
-        casas = {c: o for c, o in odds_casas.get(mercado, {}).items() if o > 1.0}
-        if prob <= 0 or not casas:
+    for chave, casas in odds_casas.items():
+        casas = {c: o for c, o in casas.items() if o > 1.0}
+        if not casas:
             continue
         casa, odd = max(casas.items(), key=lambda x: x[1])
-        value = round((prob / 100) * odd - 1, 4)
-        if value > VALUE_MINIMO:
+        if chave.startswith("ah_"):
+            if not placares:
+                continue
+            lado, txt = chave.split("@")
+            linha = float(txt)
+            ev = sum(p * lucro_aposta(lado, gc, gf, odd, linha) for gc, gf, p in placares)
+            prob = round(sum(p for gc, gf, p in placares
+                             if lucro_aposta(lado, gc, gf, odd, linha) > 0) * 100, 2)
+            label = f"AH {'Casa' if lado == 'ah_casa' else 'Fora'} {linha:+.2f}"
+            mercado = lado
+        else:
+            prob = probs_cal.get(chave)
+            if not prob:
+                continue
+            ev, linha, mercado, label = (prob / 100) * odd - 1, None, chave, LABELS.get(chave, chave)
+        if ev > VALUE_MINIMO:
             values.append({
-                "mercado": mercado, "label": LABELS.get(mercado, mercado),
-                "casa": casa, "odd": odd, "prob_modelo": prob,
-                "prob_implicita": round(100 / odd, 2), "value": value,
-                "edge": round(prob - 100 / odd, 2),
+                "mercado": mercado, "linha": linha, "label": label, "casa": casa, "odd": odd,
+                "prob_modelo": prob, "prob_implicita": round(100 / odd, 2),
+                "value": round(ev, 4), "edge": round(prob - 100 / odd, 2),
+                "estrategia": mercado == "ah_fora" and ev > AH_VISITANTE_EV_MIN,
             })
-    values.sort(key=lambda x: -x["value"])
+    values.sort(key=lambda x: (not x["estrategia"], -x["value"]))
     return values
 
 
 def montar_bloco_value_bets(values: list) -> str:
     if not values: return ""
     SEP    = "━" * 34
-    linhas = ["", SEP, "📝 DIVERGÊNCIAS MODELO x CASA (simulação)", SEP,
-              "Registradas para medir o ROI real. NÃO é dica de aposta:",
-              "no teste com odds reais da Bet365 (2022-26) essa regra",
-              "deu prejuízo (-11,9% em 1X2 e gols)."]
-    for idx, v in enumerate(values[:4], 1):
-        linhas += [
-            "", f"#{idx} {v['label']} — {v['casa']} @ {v['odd']}",
-            f"   Modelo {v['prob_modelo']}% x casa {v['prob_implicita']}% (value {round(v['value']*100,1)}%)",
-        ]
+    linhas = []
+    teste  = [v for v in values if v.get("estrategia")]
+    outras = [v for v in values if not v.get("estrategia")]
+    if teste:
+        v = teste[0]
+        linhas += ["", SEP, "⭐ SINAL EM TESTE — AH VISITANTE", SEP,
+                   f"{v['label']} — {v['casa']} @ {v['odd']} (EV +{round(v['value']*100,1)}%)",
+                   "Backtest com odds reais (7 ligas, 2022-26):",
+                   "+4,7% e +4,8% nas duas metades. Ainda NÃO",
+                   "comprovado: acompanhe o ROI no relatório semanal."]
+    if outras:
+        linhas += ["", SEP, "📝 DIVERGÊNCIAS MODELO x CASA (simulação)", SEP,
+                   "Registradas para medir o ROI real. NÃO é dica de aposta:",
+                   "em 1X2 e gols essa regra deu prejuízo (-11,9%)."]
+        for idx, v in enumerate(outras[:4], 1):
+            linhas += ["", f"#{idx} {v['label']} — {v['casa']} @ {v['odd']}",
+                       f"   Modelo {v['prob_modelo']}% x casa {v['prob_implicita']}% (value {round(v['value']*100,1)}%)"]
+    return "\n".join(linhas)
+
+
+def montar_bloco_escanteios(probs_cal: dict, lam_esc) -> str:
+    if lam_esc is None:
+        return ""
+    SEP = "━" * 34
+    linhas = ["", SEP, f"🚩 ESCANTEIOS — esperado {lam_esc} no jogo", SEP]
+    for linha in LINHAS_ESC:
+        po, pu = probs_cal[f"esc_over_{linha}"], probs_cal[f"esc_under_{linha}"]
+        linhas.append(f"  +{linha}: {po}% (odd justa {round(100/po, 2) if po else '-'})"
+                      f" | -{linha}: {pu}% (odd justa {round(100/pu, 2) if pu else '-'})")
+    linhas.append("  Modelo calibrado, mas com pouca vantagem sobre a média da liga.")
     return "\n".join(linhas)
 
 
@@ -2429,29 +2691,35 @@ def processar_backtest(log: list, jogos_finalizados: list) -> dict:
         g  = j.get("goals", {})
         if g.get("home") is None or g.get("away") is None:
             continue
-        mapa[str(j.get("fixture", {}).get("id", ""))] = (int(g["home"]), int(g["away"]))
+        ch, ca = _estat(j, "h", "esc"), _estat(j, "a", "esc")
+        esc = ch + ca if ch is not None and ca is not None else None
+        mapa[str(j.get("fixture", {}).get("id", ""))] = (int(g["home"]), int(g["away"]), esc)
     acertos_m = {}; total_m = {}; roi_m = {}; apostas_m = {}; atualizados = 0
     for entrada in log:
         res = mapa.get(entrada.get("fixture_id", ""))
         if not res or entrada.get("resultado") is not None:
             continue
-        gc, gf = res
+        gc, gf, esc = res
         atualizados += 1
         acertou_algum = False
         for mercado, prob in entrada.get("probs_calibradas", {}).items():
             if prob < PROB_MINIMA: continue
             try:
-                ocorreu = lucro_aposta(mercado, gc, gf, 2.0) > 0
+                ocorreu = lucro_aposta(mercado, gc, gf, 2.0, escanteios=esc) > 0
             except ValueError:
                 continue
             acertos_m[mercado] = acertos_m.get(mercado, 0) + (1 if ocorreu else 0)
             total_m[mercado]   = total_m.get(mercado, 0) + 1
             acertou_algum = acertou_algum or ocorreu
         for vb in entrada.get("apostas_simuladas", []):
-            l = lucro_aposta(vb["mercado"], gc, gf, vb["odd"], vb.get("linha"))
+            try:
+                l = lucro_aposta(vb["mercado"], gc, gf, vb["odd"], vb.get("linha"), esc)
+            except ValueError:
+                continue                     # escanteio sem dado: não liquida
             vb["lucro"] = round(10.0 * l, 2)
-            roi_m[vb["mercado"]]     = round(roi_m.get(vb["mercado"], 0.0) + vb["lucro"], 2)
-            apostas_m[vb["mercado"]] = apostas_m.get(vb["mercado"], 0) + 1
+            grupo = "estrategia" if vb.get("estrategia") else "outras"
+            roi_m[grupo]     = round(roi_m.get(grupo, 0.0) + vb["lucro"], 2)
+            apostas_m[grupo] = apostas_m.get(grupo, 0) + 1
         entrada["resultado"]   = "acerto" if acertou_algum else "erro"
         entrada["placar_real"] = f"{gc}-{gf}"
     return {"atualizados": atualizados, "acertos_mercado": acertos_m, "total_mercado": total_m,
@@ -2468,11 +2736,12 @@ def montar_relatorio_backtest(bt: dict, placar: str = "", nc: str = "", nf: str 
         tot  = bt["total_mercado"][mercado]
         acer = bt["acertos_mercado"].get(mercado, 0)
         linhas.append(f"  {LABELS.get(mercado, mercado)}: {acer}/{tot}")
-    if bt.get("apostas_mercado"):
-        n   = sum(bt["apostas_mercado"].values())
-        tot = sum(bt["roi_mercado"].values())
-        linhas += ["", f"📝 Simulação (R$10 por divergência): {n} aposta(s) | "
-                       f"{'+' if tot >= 0 else '-'}R${abs(tot):.2f}"]
+    nomes = {"estrategia": "⭐ AH visitante (em teste)", "outras": "📝 Outras divergências"}
+    for grupo in ("estrategia", "outras"):
+        n = bt.get("apostas_mercado", {}).get(grupo)
+        if n:
+            tot = bt["roi_mercado"].get(grupo, 0.0)
+            linhas.append(f"{nomes[grupo]} (R$10 cada): {n} | {'+' if tot >= 0 else '-'}R${abs(tot):.2f}")
     return "\n".join(linhas)
 
 
@@ -2537,9 +2806,11 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
 
             if "lucro" in vb:
 
-                roi_semana[vb["mercado"]] = round(roi_semana.get(vb["mercado"], 0) + vb["lucro"], 2)
+                g = "estrategia" if vb.get("estrategia") else "outras"
 
-                n_sim[vb["mercado"]] = n_sim.get(vb["mercado"], 0) + 1
+                roi_semana[g] = round(roi_semana.get(g, 0) + vb["lucro"], 2)
+
+                n_sim[g] = n_sim.get(g, 0) + 1
 
     data_str = agora_brt().strftime("%d/%m/%Y")
 
@@ -2553,10 +2824,12 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
         t = tot_semana[merc]; a = acc_semana.get(merc, 0)
         linhas.append(f"  {LABELS.get(merc, merc)}: {a}/{t} ({round(a / t * 100, 1) if t else 0}%)")
     if n_sim:
-        r_tot = sum(roi_semana.values()); n_tot = sum(n_sim.values())
-        roi_pct = r_tot / (10 * n_tot) * 100
-        linhas += ["", "📝 Simulação das divergências (R$10 cada):",
-                   f"  {n_tot} apostas | {'+' if r_tot >= 0 else '-'}R${abs(r_tot):.2f} | ROI {roi_pct:+.1f}%"]
+        linhas += ["", "📝 Simulação (R$10 por aposta):"]
+        for g, nome in (("estrategia", "⭐ AH visitante (em teste)"), ("outras", "Outras divergências")):
+            if n_sim.get(g):
+                r_tot, n_tot = roi_semana.get(g, 0), n_sim[g]
+                linhas.append(f"  {nome}: {n_tot} apostas | {'+' if r_tot >= 0 else '-'}R${abs(r_tot):.2f}"
+                              f" | ROI {r_tot / (10 * n_tot) * 100:+.1f}%")
 
     if jogos_proximos:
 
@@ -2592,7 +2865,7 @@ def carregar_params_modelo() -> dict:
 
         "rho_dixon_coles": RHO_DIXON_COLES, "lambda_decay": LAMBDA_DECAY,
 
-        "peso_poisson": 0.60, "peso_mc": 0.40, "fator_casa": 1.0, "motor": 7,
+        "peso_poisson": 0.60, "peso_mc": 0.40, "fator_casa": 1.0, "motor": 8,
 
         "prob_minima": float(PROB_MINIMA), "versao": 1, "jogos_treinados": 0,
 
@@ -2608,11 +2881,12 @@ def carregar_params_modelo() -> dict:
 
                 saved = json.load(f)
 
-            if saved.get("motor") == 7:
+            if saved.get("motor") == 8:
                 defaults.update(saved)
             else:
                 # parâmetros do motor antigo (Copa) não servem para o motor novo
-                print("  🧠 Parâmetros do modelo antigo descartados (motor v7)")
+                print("  🧠 Parâmetros do modelo antigo descartados (motor v8)")
+                defaults["lambda_decay"] = LAMBDA_DECAY
 
     except Exception as e:
 
@@ -2902,8 +3176,9 @@ def calcular_probabilidades(jogo: dict, jogos_c: list, jogos_f: list, jogos_h2h:
 
     mh, ma  = medias_de_gols(jogos_finalizados)
     media   = (mh + ma) / 2
-    forca_c = calcular_forca_time(jogos_c, id_c, media)
-    forca_f = calcular_forca_time(jogos_f, id_f, media)
+    me      = medias_estatisticas(jogos_finalizados + jogos_c + jogos_f)
+    forca_c = calcular_forca_time(jogos_c, id_c, media, me["conv"])
+    forca_f = calcular_forca_time(jogos_f, id_f, media, me["conv"])
 
     lc, lf = calcular_lambdas(forca_c, forca_f, mh, ma, dias_c, dias_f)
     if desf_c and desf_f:
@@ -2914,12 +3189,24 @@ def calcular_probabilidades(jogo: dict, jogos_c: list, jogos_f: list, jogos_h2h:
     probs_poisson = derivar_mercados_poisson(placares)
     probs_mc      = monte_carlo(lc, lf, MONTE_CARLO_N)
     probs_cal     = aplicar_platt_todos(ensemble(probs_poisson, probs_mc, h2h, fase), PLATT_PARAMS)
+
+    # Escanteios: só com histórico de escanteios suficiente dos dois times
+    media_esc = (me["esc_casa"] + me["esc_fora"]) / 2
+    ec = calcular_forca_escanteios(jogos_c, id_c, media_esc)
+    ef = calcular_forca_escanteios(jogos_f, id_f, media_esc)
+    lam_esc = None
+    if ec["jogos"] >= ESC_MIN_JOGOS and ef["jogos"] >= ESC_MIN_JOGOS:
+        lam_esc = round(ec["ataque"] * ef["cede"] * me["esc_casa"]
+                        + ef["ataque"] * ec["cede"] * me["esc_fora"], 2)
+        probs_cal.update(prob_escanteios(lam_esc))
+
     return {
+        "placares": placares, "lam_esc": lam_esc,
         "mc": mc, "mf": mf, "h2h": h2h, "dias_c": dias_c, "dias_f": dias_f,
         "forca_c": forca_c, "forca_f": forca_f, "lc": lc, "lf": lf, "fase": fase,
         "probs_poisson": probs_poisson, "probs_mc": probs_mc, "probs_cal": probs_cal,
         "ha_resultado": selecionar_melhor_handicap(placares, lc, lf),
-        "tem_xg": mc.get("tem_xg", False) or mf.get("tem_xg", False),
+        "tem_xg": forca_c.get("com_chutes", 0) >= 5 and forca_f.get("com_chutes", 0) >= 5,
     }
 
 
@@ -2951,6 +3238,10 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
         print("  [SEM DADOS SUFICIENTES] — não será reanalisado hoje")
         return budget, add_cache(fid, cache)
 
+    # chutes no alvo e escanteios dos jogos do histórico (em lote, com cache)
+    budget = buscar_estatisticas([j.get("fixture", {}).get("id") for j in jogos_c + jogos_f], budget)
+    anexar_estats(jogos_c); anexar_estats(jogos_f)
+
     jogos_h2h, budget = buscar_h2h(id_c, id_f, JOGOS_H2H, budget)
 
     desf_c = desf_f = None
@@ -2973,13 +3264,13 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
 
     # Odds REAIS das casas. Sem odd real não existe value bet: nada é estimado.
     odds_reais, budget = buscar_odds_reais(int(fid), budget)
-    value_bets = calcular_value_bets(probs_cal, odds_reais) if odds_reais else []
+    value_bets = calcular_value_bets(probs_cal, odds_reais, r["placares"]) if odds_reais else []
     if odds_reais:
         bloco_vb = montar_bloco_value_bets(value_bets) or (
             "\n" + "━" * 34 + "\n📝 Odds reais conferidas: modelo e casas concordam.")
     else:
         bloco_vb = ("\n" + "━" * 34 + "\n📝 Sem odds reais das casas para este jogo.")
-    melhor_odd = {m: max(c.values()) for m, c in odds_reais.items() if c}
+    melhor_odd = {m: max(c.values()) for m, c in odds_reais.items() if c and "@" not in m}
 
     alerta = montar_alerta(
         jogo, probs_cal, r["mc"], r["mf"], r["h2h"], r["fase"], r["lc"], r["lf"],
@@ -2994,7 +3285,8 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
             desf_bloco = f"\n{'─'*34}\n🏥 DESFALQUES:\n"
             if desf_c["ausentes"]: desf_bloco += f"  {nc}: {', '.join(desf_c['ausentes'][:3])}\n"
             if desf_f["ausentes"]: desf_bloco += f"  {nf}: {', '.join(desf_f['ausentes'][:3])}\n"
-        enviar_telegram(alerta + score_bloco + desf_bloco + bloco_vb)
+        enviar_telegram(alerta + montar_bloco_escanteios(probs_cal, r["lam_esc"])
+                        + score_bloco + desf_bloco + bloco_vb)
         print("    ✅ Alerta enviado!")
         salvar_log({
             "data": datetime.now().isoformat(), "fixture_id": fid,
@@ -3007,8 +3299,10 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
             "probs_poisson": r["probs_poisson"], "probs_mc": r["probs_mc"], "probs_calibradas": probs_cal,
             "handicap_recomendado": r["ha_resultado"].get("recomendada"),
             "value_bets": [v["mercado"] for v in value_bets[:3]],
-            "apostas_simuladas": [{"mercado": v["mercado"], "casa": v["casa"], "odd": v["odd"],
-                                   "prob": v["prob_modelo"]} for v in value_bets[:4]],
+            "apostas_simuladas": [{"mercado": v["mercado"], "linha": v["linha"], "casa": v["casa"],
+                                   "odd": v["odd"], "prob": v["prob_modelo"], "ev": v["value"],
+                                   "estrategia": v["estrategia"]} for v in value_bets[:5]],
+            "lambda_escanteios": r["lam_esc"],
             "odds_reais": melhor_odd,
             "line_movement": movimentos, "resultado": None, "placar_real": None,
         })
@@ -3066,6 +3360,10 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
     jogos, budget = buscar_jogos_proximos(budget)
 
     finalizados, budget = buscar_jogos_finalizados(budget)
+
+    budget = buscar_estatisticas([j.get("fixture", {}).get("id") for j in finalizados], budget, max_lotes=3)
+
+    anexar_estats(finalizados)
 
     if jogos:
 
@@ -3242,7 +3540,7 @@ if __name__ == "__main__":
 
         "  💪 Força ataque/defesa por time\n  💤 Fator descanso entre jogos\n"
 
-        "  🔄 Variação do modelo\n"
+        "  🔄 Variação do modelo\n  🚩 Escanteios\n  ⭐ AH visitante (em teste)\n"
 
         "  📊 Score de confiança 0-100\n"
 

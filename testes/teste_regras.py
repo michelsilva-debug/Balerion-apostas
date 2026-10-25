@@ -104,8 +104,8 @@ bt = p.processar_backtest(log, fin)
 check(log[0]["placar_real"] == "1-1", "liquidou pelo 1x1 dos 90 min")
 check(bt["total_mercado"] == {"vitoria_casa": 1, "over15": 1} and bt["acertos_mercado"].get("over15") == 1
       and bt["acertos_mercado"].get("vitoria_casa", 0) == 0, f"acertos {bt['acertos_mercado']} de {bt['total_mercado']}")
-check(bt["roi_mercado"] == {"empate": 24.0, "ah_fora": 9.0},
-      f"simulação: empate @3.4 = +R$24, fora +0.75 empate @1.9 = +R$9 → {bt['roi_mercado']}")
+check(bt["roi_mercado"] == {"outras": 33.0},
+      f"simulação: empate @3.4 = +R$24 + fora +0.75 empate @1.9 = +R$9 → {bt['roi_mercado']}")
 rel = p.montar_relatorio_backtest(bt)
 check("+R$33.00" in rel, "relatório soma +R$33.00")
 check(p.processar_backtest(log, fin)["atualizados"] == 0, "não liquida o mesmo jogo duas vezes")
@@ -126,6 +126,81 @@ txt += p.montar_bloco_value_bets(p.calcular_value_bets(probs, {"vitoria_casa": {
 check("Modo observação" in txt, "aviso de modo observação no topo")
 check("Stake" not in txt and "R$" not in txt, "nenhum valor em R$ para apostar")
 check("NÃO é dica de aposta" in txt, "divergências marcadas como simulação")
+
+print("\n### 9. Escanteios: liquidação e probabilidades")
+check(p.lucro_aposta("esc_over_9.5", 0, 0, 1.9, escanteios=10) == 0.9, "+9.5 com 10 escanteios ganha")
+check(p.lucro_aposta("esc_over_9.5", 0, 0, 1.9, escanteios=9) == -1.0, "+9.5 com 9 escanteios perde")
+check(p.lucro_aposta("esc_under", 0, 0, 1.9, linha=10.5, escanteios=10) == 0.9, "-10.5 com 10 escanteios ganha")
+try:
+    p.lucro_aposta("esc_over_9.5", 0, 0, 1.9); check(False, "sem escanteios deveria recusar")
+except ValueError:
+    check(True, "sem total de escanteios não liquida (não inventa resultado)")
+pe = p.prob_escanteios(9.9)
+check(all(abs(pe[f"esc_over_{l}"] + pe[f"esc_under_{l}"] - 100) < 0.01 for l in p.LINHAS_ESC), "over + under = 100% em cada linha")
+check(pe["esc_over_8.5"] > pe["esc_over_9.5"] > pe["esc_over_10.5"], f"linhas em ordem: {pe['esc_over_8.5']} > {pe['esc_over_9.5']} > {pe['esc_over_10.5']}")
+check(abs(sum(p._prob_total_nb(9.9, k) for k in range(80)) - 1) < 1e-6, "binomial negativa soma 1")
+
+print("\n### 10. Odds de handicap: as duas convenções das casas")
+prop = dict(p._chaves_ah([("Home -0.5", 1.9), ("Away +0.5", 1.95), ("Home -1", 2.4), ("Away +1", 1.55)]))
+mand = dict(p._chaves_ah([("Home -0.5", 1.9), ("Away -0.5", 1.95), ("Home -1", 2.4), ("Away -1", 1.55)]))
+check(prop.get("ah_fora@+0.50") == 1.95 and prop.get("ah_casa@-0.50") == 1.9, f"'Away +0.5' = visitante +0.5: {prop}")
+check(mand.get("ah_fora@+0.50") == 1.95 and mand.get("ah_fora@+1.00") == 1.55, f"'Away -0.5' (linha do mandante) = visitante +0.5: {mand}")
+
+print("\n### 11. Leitura das odds da API (AH, escanteios, ignora 1º tempo)")
+resp = [{"bookmakers": [{"name": "Bet365", "bets": [
+    {"name": "Match Winner", "values": [{"value": "Home", "odd": "2.10"}]},
+    {"name": "Asian Handicap", "values": [{"value": "Home -0.75", "odd": "2.05"}, {"value": "Away +0.75", "odd": "1.80"}]},
+    {"name": "Asian Handicap First Half", "values": [{"value": "Home -0.25", "odd": "1.90"}]},
+    {"name": "Corners Over Under", "values": [{"value": "Over 9.5", "odd": "1.85"}, {"value": "Under 9.5", "odd": "1.95"}, {"value": "Over 12.5", "odd": "3.0"}]},
+    {"name": "1st Half Corners", "values": [{"value": "Over 4.5", "odd": "1.8"}]}]}]}]
+orig = p.api_get
+p.api_get = lambda ep, prm, b: (resp, b)
+od, _ = p.buscar_odds_reais(1, {"data": "x", "calls_usadas": 0})
+p.api_get = orig
+check(od.get("ah_casa@-0.75") == {"Bet365": 2.05} and od.get("ah_fora@+0.75") == {"Bet365": 1.8}, "handicap lido com a linha de cada time")
+check(od.get("esc_over_9.5") == {"Bet365": 1.85} and od.get("esc_under_9.5") == {"Bet365": 1.95}, "escanteios +9.5/-9.5 lidos")
+check(not any("0.25" in k for k in od) and "esc_over_4.5" not in od and "esc_over_12.5" not in od, f"1º tempo e linhas fora do modelo ignorados: {sorted(od)}")
+
+print("\n### 12. Value do handicap = EV exato pela matriz; marca a estratégia em teste")
+pl = p.matriz_placares(1.0, 1.6)                       # visitante mais forte
+vb = p.calcular_value_bets({}, {"ah_fora@+0.75": {"Bet365": 2.3}, "ah_casa@-0.75": {"Bet365": 1.5}}, pl)
+ev = sum(x * p.lucro_aposta("ah_fora", a, b, 2.3, 0.75) for a, b, x in pl)
+check(len(vb) == 1 and vb[0]["mercado"] == "ah_fora" and abs(vb[0]["value"] - round(ev, 4)) < 1e-9, f"EV exato {ev:.4f} = {vb and vb[0]['value']}")
+check(vb and vb[0]["estrategia"] is True, "AH visitante com EV > 8% marcado como estratégia em teste")
+od5 = next(o / 100 for o in range(101, 400)
+           if 0.04 < sum(x * p.lucro_aposta("ah_fora", a, b, o / 100, 0.75) for a, b, x in pl) < 0.07)
+vb2 = p.calcular_value_bets({}, {"ah_fora@+0.75": {"Bet365": od5}}, pl)
+check(len(vb2) == 1 and not vb2[0]["estrategia"], f"EV {vb2 and vb2[0]['value']} (entre 3% e 8%) entra como divergência comum, não como estratégia")
+bloco = p.montar_bloco_value_bets(vb)
+check("SINAL EM TESTE" in bloco and "NÃO" in bloco and "R$" not in bloco, "bloco do sinal: avisa que não é comprovado, sem stake")
+
+print("\n### 13. Liquidação separa estratégia x outras")
+log2 = [{"fixture_id": "20", "probs_calibradas": {"esc_over_9.5": 62.0},
+         "apostas_simuladas": [{"mercado": "ah_fora", "linha": 0.75, "odd": 2.3, "estrategia": True},
+                               {"mercado": "esc_over_9.5", "linha": None, "odd": 1.85, "estrategia": False}],
+         "resultado": None}]
+fin2 = [{"fixture": {"id": 20}, "goals": {"home": 1, "away": 1}, "estat": {"h": {"esc": 6}, "a": {"esc": 5}}}]
+bt2 = p.processar_backtest(log2, fin2)
+check(bt2["roi_mercado"] == {"estrategia": 13.0, "outras": 8.5}, f"AH fora +0.75 empate @2.3 = +R$13, +9.5 com 11 escanteios @1.85 = +R$8.50 → {bt2['roi_mercado']}")
+check(bt2["acertos_mercado"].get("esc_over_9.5") == 1, "indicação de escanteios conferida com o total real")
+
+print("\n### 14. Estatísticas da API e força com chutes no alvo")
+item = {"teams": {"home": {"id": 1}, "away": {"id": 2}}, "statistics": [
+    {"team": {"id": 1}, "statistics": [{"type": "Shots on Goal", "value": 6}, {"type": "Corner Kicks", "value": 7}]},
+    {"team": {"id": 2}, "statistics": [{"type": "Shots on Goal", "value": None}, {"type": "Corner Kicks", "value": "3"}]}]}
+e = p.extrair_estats_api(item)
+check(e == {"h": {"sot": 6, "esc": 7}, "a": {"sot": None, "esc": 3}}, f"lê chutes no alvo e escanteios: {e}")
+check(p.extrair_estats_api({"teams": {}, "statistics": []}) is None, "sem estatística = None")
+hist = [{"fixture": {"id": i, "date": "2026-10-01T18:00:00+00:00"}, "teams": {"home": {"id": 1}, "away": {"id": 9}},
+         "goals": {"home": 0, "away": 0}, "estat": {"h": {"sot": 8, "esc": 8}, "a": {"sot": 1, "esc": 2}}} for i in range(10)]
+so_gols = p.calcular_forca_time(hist, 1, 1.35)
+com_chutes = p.calcular_forca_time(hist, 1, 1.35, conv=0.32)
+check(com_chutes["alpha"] > so_gols["alpha"] and com_chutes["com_chutes"] == 10,
+      f"0 gols mas 8 chutes no alvo por jogo: ataque {so_gols['alpha']} → {com_chutes['alpha']}")
+me = p.medias_estatisticas(hist)
+check(0.0 < me["conv"] < 0.32 and me["esc_casa"] > p.MEDIA_ESC_CASA_PADRAO, f"médias da liga a partir dos jogos: {me}")
+fe = p.calcular_forca_escanteios(hist, 1, 5.0)
+check(fe["jogos"] == 10 and fe["ataque"] > 1 and fe["cede"] < 1, f"força de escanteios: {fe}")
 
 print("\n" + ("TUDO OK" if not falhas else f"{len(falhas)} FALHA(S)"))
 sys.exit(1 if falhas else 0)

@@ -109,12 +109,55 @@ delas. Só faz sentido apostar se esse ROI ficar positivo por vários meses.
 Conferido também: a odd justa do handicap (inclusive quartos de linha) dá EV ≈ 0 pela
 liquidação exata; Kelly fracionado e cálculo de value batem com a fórmula.
 
+---
+
+# Melhorias v8 — Handicap asiático e escanteios (25/10/2026)
+
+Tudo o que existia continua. Validado com o **código real do bot** em 9.390 jogos de
+7 ligas (Premier, La Liga, Serie A, Bundesliga, Ligue 1, Portugal, Holanda), com
+treino 2022-24 e prova 2024-26 separados. Dados: github.com/xgabora/Club-Football-Match-Data-2000-2025.
+
+## O que mudou no modelo
+- **Chutes no alvo**: a força de cada time mistura gols reais (50%) com
+  "chutes no alvo x conversão da liga" (50%). Chute no alvo é sinal mais estável.
+- **Histórico maior**: 20 jogos (antes 10), recência mais suave (0,01/dia) e
+  encolhimento de 8 jogos — escolhidos no treino, confirmados na prova.
+- **Escanteios (mercado novo)**: força a favor/contra de cada time x média da liga,
+  binomial negativa (escanteios variam mais que Poisson). Linhas 8.5 / 9.5 / 10.5.
+- **Odds reais de handicap asiático e escanteios** lidas da API (as duas convenções
+  de linha do visitante são detectadas automaticamente).
+- **Estatísticas em lote**: até 20 jogos por chamada (`fixtures?ids=`), com cache em
+  disco; falha só é tentada de novo após 6h. Cada análise gasta até 7 chamadas.
+
+## Resultados
+| | Treino | Prova |
+|---|---|---|
+| Todo AH visitante, sem modelo | −0,3% | +0,7% |
+| **⭐ AH visitante com EV > 8% (estratégia em teste)** | **+4,7% ± 4,1** | **+4,9% ± 4,2** |
+| AH mandante (divergência) | +1,5% | −1,6% |
+
+Positiva em 6 das 7 ligas (Portugal ≈ 0%). **Não está comprovada**: cada metade ainda
+cabe dentro da margem de erro. Fica como **sinal em teste** no alerta e na simulação;
+o relatório semanal mostra o ROI dela separado das outras divergências.
+
+Escanteios (prova): calibrado — promete 56% → acontece 56%, 64% → 65%, 73% → 74% (+8.5).
+Ganho sobre a média da liga é pequeno (~1%) e não há odds históricas de escanteio
+para medir lucro: só a simulação ao vivo vai dizer.
+
+Gols/1X2 (openfootball, 3.932 jogos): vitória casa/fora agora 8,4% / 8,7% melhores
+que a média do campeonato (antes 6,6% / 6,5%).
+
+## Brasileirão e Libertadores
+O conjunto histórico não tem chutes, escanteios nem odds de AH do Brasil: as melhorias
+valem lá também, mas **só foram provadas nas ligas europeias**.
+
 ## Como repetir os testes
 ```
-python3 testes/teste_regras.py                       # 57 testes de regras e liquidação
-python3 testes/teste_falhas.py                       # 9 cenários de falha
+python3 testes/teste_regras.py                       # regras, liquidação, escanteios, odds AH
+python3 testes/teste_falhas.py                       # 10 cenários de falha
 git clone --depth 1 https://github.com/openfootball/football.json
 OPENFOOTBALL_DIR=football.json python3 testes/backtest_real.py
 git clone --depth 1 https://github.com/xgabora/Club-Football-Match-Data-2000-2025
 python3 testes/backtest_odds.py                      # regra x odds reais da Bet365
+python3 testes/backtest_handicap.py                  # AH visitante + escanteios (código do bot)
 ```
