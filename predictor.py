@@ -175,7 +175,10 @@ LIGAS = {
 HORAS_ANTECEDENCIA = 24
 
 # Chamadas por jogo analisado: histórico casa, histórico fora, H2H, odds, desfalques
-CALLS_POR_JOGO = 7   # + até 2 lotes de estatísticas (chutes/escanteios)
+CALLS_POR_JOGO = 7   # + até 2 buscas de estatísticas (chutes/escanteios)
+
+# Plano grátis: sem busca em lote, cada jogo custa 1 chamada. Teto por dia:
+ESTATS_MAX_DIA = int(os.getenv("ESTATS_MAX_DIA", "20"))
 
 # Estratégia em teste: handicap asiático do VISITANTE com EV > 8%.
 # Backtest com odds reais da Bet365 (7 ligas): treino +4,7%, prova +4,8%
@@ -673,16 +676,20 @@ INTERVALO_MIN_CHAMADAS = float(os.getenv("API_INTERVALO_SEG", "6.5"))
 
 _ultima_chamada = [0.0]
 
-_aviso_erro_api = {"dia": None}
+_aviso_erro_api = {"avisados": set(), "ultimo": ""}
 
 
 def _registrar_erro_api(endpoint: str, params: dict, erros) -> None:
     texto = json.dumps(erros, ensure_ascii=False)[:300]
     print(f"  [API] {endpoint} {params} → ERRO: {texto}")
+    _aviso_erro_api["ultimo"] = texto
     hoje = agora_brt().strftime("%Y-%m-%d")
+    chave = (hoje, endpoint, texto[:60])
     graves = ("plan", "season", "access", "token", "key", "suspend", "limit")
-    if _aviso_erro_api["dia"] != hoje and any(p in texto.lower() for p in graves):
-        _aviso_erro_api["dia"] = hoje
+    # o bloqueio de "ids" no plano grátis é tratado sozinho (busca jogo a jogo)
+    tratado = "ids parameter" in texto.lower()
+    if not tratado and chave not in _aviso_erro_api["avisados"] and any(p in texto.lower() for p in graves):
+        _aviso_erro_api["avisados"].add(chave)
         enviar_telegram(
             "⚠️ BALERION — a API-Football recusou uma requisição\n"
             f"{endpoint}: {texto}\n\n"
@@ -947,7 +954,7 @@ def _cache_estats() -> dict:
 def _salvar_estats() -> None:
     c = _cache_estats()
     if len(c) > 4000:                      # guarda só os mais recentes
-        for k in list(c)[:-4000]:
+        for k in [k for k in c if k != "_meta"][:-4000]:
             c.pop(k, None)
     try:
         _salvar_json(ARQUIVO_ESTATS, c)
@@ -977,30 +984,73 @@ def extrair_estats_api(item: dict):
     return out if "h" in out and "a" in out else None
 
 
-def buscar_estatisticas(fids: list, budget: dict, max_lotes: int = 2):
-    """Busca chutes/escanteios de até 20 jogos por chamada (fixtures?ids=)."""
+def _meta_estats() -> dict:
+    meta = _cache_estats().setdefault("_meta", {})
+    if meta.get("dia") != hoje_utc():
+        meta["dia"], meta["usadas"] = hoje_utc(), 0
+    return meta
+
+
+def buscar_estatisticas(jogos: list, budget: dict, max_chamadas: int = 2):
+    """Chutes no alvo e escanteios dos jogos (com cache em disco).
+
+    Tenta em lote (fixtures?ids=, 20 por chamada). O plano grátis não permite:
+    aí passa a buscar jogo a jogo (fixtures/statistics), do mais recente para o
+    mais antigo, respeitando ESTATS_MAX_DIA. Falha só é tentada de novo após 6h.
+    """
     cache = _cache_estats()
+    meta  = _meta_estats()
     agora = time.time()
-    # falha anterior só é tentada de novo depois de 6h (não queima cota a cada ciclo)
-    faltam = [str(f) for f in dict.fromkeys(fids) if f and (
-        str(f) not in cache or agora - cache[str(f)].get("falha", agora) > 6 * 3600)]
-    lotes = 0
-    for i in range(0, len(faltam), 20):
-        if lotes >= max_lotes or calls_disponiveis(budget) <= BUDGET_EMERGENCIA + 2:
+    por_id = {}
+    for j in jogos:
+        fid = str(j.get("fixture", {}).get("id", "") or "")
+        if fid and fid != "_meta":
+            por_id.setdefault(fid, j)
+    faltam = [f for f in por_id if f not in cache
+              or agora - cache[f].get("falha", agora) > 6 * 3600]
+    faltam.sort(key=lambda f: por_id[f].get("fixture", {}).get("date", ""), reverse=True)
+    chamadas = 0
+    mudou = False
+
+    def marca_falha(fids):
+        for f in fids:
+            cache[f] = {"falha": agora, "vazio": True}
+
+    # 1) em lote (planos pagos)
+    while faltam and not meta.get("sem_ids") and chamadas < max_chamadas:
+        if calls_disponiveis(budget) <= BUDGET_EMERGENCIA + 2:
             break
-        lote = faltam[i:i + 20]
+        lote, faltam = faltam[:20], faltam[20:]
         dados, budget = api_get("fixtures", {"ids": "-".join(lote)}, budget)
-        lotes += 1
+        chamadas += 1; mudou = True
         if not dados:
-            for fid in lote:              # falha: tenta de novo daqui a 6h
-                cache[fid] = {"falha": agora, "vazio": True}
+            if "ids parameter" in _aviso_erro_api["ultimo"].lower():
+                meta["sem_ids"] = True          # plano grátis: muda de estratégia
+                print("  📊 Plano sem busca em lote: estatísticas jogo a jogo")
+                faltam = lote + faltam
+            else:
+                marca_falha(lote)
             continue
         for item in dados:
-            fid = str(item.get("fixture", {}).get("id", ""))
-            cache[fid] = extrair_estats_api(item) or {"vazio": True}
-        for fid in lote:
-            cache.setdefault(fid, {"vazio": True})
-    if lotes:
+            f = str(item.get("fixture", {}).get("id", ""))
+            cache[f] = extrair_estats_api(item) or {"vazio": True}
+        for f in lote:
+            cache.setdefault(f, {"vazio": True})
+
+    # 2) jogo a jogo (plano grátis), com teto diário
+    if meta.get("sem_ids"):
+        for f in faltam:
+            if (chamadas >= max_chamadas or meta["usadas"] >= ESTATS_MAX_DIA
+                    or calls_disponiveis(budget) <= BUDGET_EMERGENCIA + 2):
+                break
+            dados, budget = api_get("fixtures/statistics", {"fixture": int(f)}, budget)
+            chamadas += 1; meta["usadas"] += 1; mudou = True
+            if dados:
+                item = {"teams": por_id[f].get("teams", {}), "statistics": dados}
+                cache[f] = extrair_estats_api(item) or {"vazio": True}
+            else:
+                marca_falha([f])
+    if mudou:
         _salvar_estats()
     return budget
 
@@ -3239,7 +3289,7 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
         return budget, add_cache(fid, cache)
 
     # chutes no alvo e escanteios dos jogos do histórico (em lote, com cache)
-    budget = buscar_estatisticas([j.get("fixture", {}).get("id") for j in jogos_c + jogos_f], budget)
+    budget = buscar_estatisticas(jogos_c + jogos_f, budget)
     anexar_estats(jogos_c); anexar_estats(jogos_f)
 
     jogos_h2h, budget = buscar_h2h(id_c, id_f, JOGOS_H2H, budget)
@@ -3361,7 +3411,7 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     finalizados, budget = buscar_jogos_finalizados(budget)
 
-    budget = buscar_estatisticas([j.get("fixture", {}).get("id") for j in finalizados], budget, max_lotes=3)
+    budget = buscar_estatisticas(finalizados, budget, max_chamadas=8)
 
     anexar_estats(finalizados)
 

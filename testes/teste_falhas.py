@@ -46,6 +46,8 @@ def fake_get(url, headers=None, params=None, timeout=None):
     if ep == "fixtures" and "ids" in p:
         if MODO.get("ids_falha"):
             return R([])
+        if MODO.get("plano_gratis"):
+            return R([], errors={"plan": "Free plans do not have access to the Ids parameter."})
         out = []
         for f in str(p["ids"]).split("-"):
             out.append({"fixture": {"id": int(f)}, "teams": {"home": {"id": 1}, "away": {"id": 2}},
@@ -71,6 +73,11 @@ def fake_get(url, headers=None, params=None, timeout=None):
         if t == 600:
             jogos[0]["goals"] = {"home": "x", "away": 1}   # força ValueError
         return R(jogos)
+    if ep == "fixtures/statistics":
+        fid = int(p["fixture"])                     # times do jogo, como a API real devolve
+        casa, fora = ((fid - 9000) // 30, 800 + (fid - 9000) % 30) if fid >= 9000 else (10, 11)
+        return R([{"team": {"id": casa}, "statistics": [{"type": "Shots on Goal", "value": 4}, {"type": "Corner Kicks", "value": 5}]},
+                  {"team": {"id": fora}, "statistics": [{"type": "Shots on Goal", "value": 2}, {"type": "Corner Kicks", "value": 3}]}])
     if ep == "fixtures/headtohead":
         return R([])
     if ep == "odds":
@@ -206,5 +213,22 @@ b, c, prm = ciclo({"data": pr.hoje_utc(), "calls_usadas": 0}, {}, prm)
 lotes = [q["ids"].count("-") + 1 for e, q in chamadas if e == "fixtures" and "ids" in q]
 check(lotes and max(lotes) <= 20, f"lotes de até 20 jogos por chamada: {lotes}")
 check(len(pr._cache_estats()) > 0 and any(not v.get("vazio") for v in pr._cache_estats().values()), "estatísticas guardadas em cache")
+
+print("\n### 11. Plano grátis sem busca em lote: estatística jogo a jogo, com teto diário")
+for f in os.listdir(DATA):
+    os.remove(os.path.join(DATA, f))
+pr._estats["dados"] = None; chamadas.clear(); telegramas.clear()
+MODO.update(plano_gratis=True, n_jogos=40, remaining=100)
+b, c, prm = ciclo({"data": pr.hoje_utc(), "calls_usadas": 0}, {}, prm)
+b, c, prm = ciclo(b, c, prm)
+lotes = [1 for e, q in chamadas if e == "fixtures" and "ids" in q]
+unit = [1 for e, q in chamadas if e == "fixtures/statistics"]
+check(len(lotes) == 1, f"tentou o lote uma vez só e mudou de estratégia ({len(lotes)} tentativa)")
+check(0 < len(unit) <= pr.ESTATS_MAX_DIA, f"estatísticas jogo a jogo: {len(unit)} (teto {pr.ESTATS_MAX_DIA}/dia)")
+check(not any("Ids" in t for t in telegramas), "não manda alerta de erro para o bloqueio de lote (já tratado)")
+check(b["calls_usadas"] <= pr.BUDGET_DIARIO, f"orçamento respeitado: {b['calls_usadas']}/{pr.BUDGET_DIARIO}")
+com = [v for k, v in pr._cache_estats().items() if k != "_meta" and not v.get("vazio")]
+check(len(com) == len(unit), f"cada busca virou estatística em cache ({len(com)})")
+MODO["plano_gratis"] = False
 
 print("\n" + ("TUDO OK" if not falhas else f"{len(falhas)} FALHA(S): {falhas}"))

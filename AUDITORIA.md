@@ -154,7 +154,7 @@ valem lá também, mas **só foram provadas nas ligas europeias**.
 ## Como repetir os testes
 ```
 python3 testes/teste_regras.py                       # regras, liquidação, escanteios, odds AH
-python3 testes/teste_falhas.py                       # 10 cenários de falha
+python3 testes/teste_falhas.py                       # 11 cenários de falha (inclui plano grátis)
 git clone --depth 1 https://github.com/openfootball/football.json
 OPENFOOTBALL_DIR=football.json python3 testes/backtest_real.py
 git clone --depth 1 https://github.com/xgabora/Club-Football-Match-Data-2000-2025
