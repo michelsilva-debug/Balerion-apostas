@@ -372,11 +372,30 @@ def agora_brt() -> datetime:
 
 
 
+def _carregar_estado_envios() -> dict:
+    # guarda em disco o que já foi enviado hoje (sobrevive a reinícios)
+    try:
+        if os.path.exists(ARQUIVO_RELATORIO):
+            with open(ARQUIVO_RELATORIO, encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _salvar_estado_envios(estado: dict) -> None:
+    try:
+        _salvar_json(ARQUIVO_RELATORIO, estado)
+    except Exception as e:
+        print(f"Erro ao salvar estado de envios: {e}")
+
+
 def eh_hora_resumo() -> bool:
 
     b = agora_brt()
 
-    return b.hour == 8 and b.minute < 30
+    return 8 <= b.hour < 14
 
 
 
@@ -429,9 +448,14 @@ def _salvar_json(path: str, dados, indent=None) -> None:
         raise
 
 
+def hoje_utc() -> str:
+    # A API-Football zera o limite diário à meia-noite UTC
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def carregar_budget() -> dict:
 
-    hoje = datetime.now().strftime("%Y-%m-%d")
+    hoje = hoje_utc()
 
     try:
 
@@ -713,9 +737,13 @@ def buscar_jogos_da_data(data_str: str, ttl_horas: float, budget: dict,
             return item.get("jogos", []), budget
     dados, budget = api_get("fixtures", {"date": data_str}, budget)
     jogos = [j for j in dados if j.get("league", {}).get("id") in LIGAS]
-    if not dados and item:
-        jogos = item.get("jogos", [])  # falhou: mantém o que já tinha
-    cache[data_str] = {"ts": agora, "jogos": jogos}
+    ts = agora
+    if not dados:
+        # a lista de um dia inteiro nunca vem vazia: é falha da API.
+        # Mantém o que já tinha e marca para tentar de novo em ~30 min.
+        jogos = item.get("jogos", []) if item else []
+        ts = agora - max(0.0, (ttl_horas or 6) * 3600 - 1800)
+    cache[data_str] = {"ts": ts, "jogos": jogos}
     for k in sorted(cache)[:-5]:
         cache.pop(k, None)
     try:
@@ -1026,111 +1054,47 @@ def _ha_linha_simples(placares: list, linha: float) -> dict:
 
 
 
+def _odd_minima_ha(prob_win: float, prob_push: float) -> float:
+    """Odd a partir da qual a aposta tem valor (push devolve a aposta)."""
+    perda = max(0.0, 100 - prob_win - prob_push)
+    return round((prob_win + perda) / prob_win, 2) if prob_win > 0 else 99.0
+
+
 def selecionar_melhor_handicap(placares: list, lc: float, lf: float) -> dict:
+    """Linhas com probabilidade entre PROB_MINIMA e 80% (odds que valem a pena).
 
-    resultados = []
-
+    Casa com linha L ganha se (gols casa - gols fora + L) > 0.
+    Fora com linha L ganha se (gols fora - gols casa + L) > 0, que é o lado
+    "fora" da linha -L do ponto de vista da casa.
+    """
+    candidatos = []
     for linha in LINHAS_HANDICAP:
-
-        ha_casa = calcular_handicap_asiatico(placares, linha)
-
-        ha_fora = calcular_handicap_asiatico(placares, -linha)
-
-        resultados.append({"linha": linha, "ha_casa": ha_casa, "ha_fora": ha_fora})
-
-
-
-    melhores_casa = []
-
-    melhores_fora = []
-
-    for r in resultados:
-
-        linha = r["linha"]
-
-        pc = r["ha_casa"]["prob_casa"]
-
-        pf = r["ha_fora"]["prob_fora"]
-
-        # FIX #5: margem de 5% para edge real
-
-        if pc >= PROB_MINIMA:
-
-            odd_fair    = round(100 / pc, 2) if pc > 0 else 2.0
-
-            odd_mercado = round(odd_fair * 0.95, 2)
-
-            edge        = round(pc - (1 / odd_mercado) * 100, 2)
-
-            melhores_casa.append({
-
-                "tipo": "casa", "linha": linha,
-
-                "label": f"AH Casa {linha:+.2f}".replace("+0.00", "0"),
-
-                "prob": pc, "prob_push": r["ha_casa"]["prob_push"],
-
-                "odd_fair": odd_fair, "edge": edge,
-
-            })
-
-        if pf >= PROB_MINIMA:
-
-            odd_fair    = round(100 / pf, 2) if pf > 0 else 2.0
-
-            odd_mercado = round(odd_fair * 0.95, 2)
-
-            edge        = round(pf - (1 / odd_mercado) * 100, 2)
-
-            melhores_fora.append({
-
-                "tipo": "fora", "linha": -linha,
-
-                "label": f"AH Fora {-linha:+.2f}".replace("+0.00", "0"),
-
-                "prob": pf, "prob_push": r["ha_fora"]["prob_push"],
-
-                "odd_fair": odd_fair, "edge": edge,
-
-            })
-
-
-
-    melhores_casa.sort(key=lambda x: -x["prob"])
-
-    melhores_fora.sort(key=lambda x: -x["prob"])
-
-    recomendada = None
-
-    for mc in melhores_casa[:3]:
-
-        if mc["prob"] >= 60 and mc["linha"] <= -0.5:
-
-            recomendada = mc
-
-            break
-
-    if not recomendada and melhores_fora:
-
-        recomendada = melhores_fora[0]
-
+        hc = calcular_handicap_asiatico(placares, linha)
+        hf = calcular_handicap_asiatico(placares, -linha)
+        for tipo, prob, push, nome in (("casa", hc["prob_casa"], hc["prob_push"], "Casa"),
+                                       ("fora", hf["prob_fora"], hf["prob_push"], "Fora")):
+            if PROB_MINIMA <= prob <= 80:
+                candidatos.append({
+                    "tipo": tipo, "linha": linha,
+                    "label": f"AH {nome} {linha:+.2f}".replace("+0.00", "0"),
+                    "prob": prob, "prob_push": push,
+                    "odd_fair": _odd_minima_ha(prob, push),
+                })
+    # mais perto de ~65%: odd razoável (~1.5) com boa chance
+    candidatos.sort(key=lambda x: abs(x["prob"] - 65))
+    casa = [c for c in candidatos if c["tipo"] == "casa"]
+    fora = [c for c in candidatos if c["tipo"] == "fora"]
     return {
-
-        "melhores_casa": melhores_casa[:4],
-
-        "melhores_fora": melhores_fora[:4],
-
-        "recomendada":   recomendada,
-
+        "melhores_casa": casa[:3],
+        "melhores_fora": fora[:3],
+        "recomendada":   candidatos[0] if candidatos else None,
         "favorito":      "casa" if lc > lf else "fora",
-
     }
-
 
 
 def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: float = 50.0) -> str:
 
-    if not ha_resultado:
+    if not ha_resultado or not ha_resultado.get("recomendada"):
 
         return ""
 
@@ -1178,7 +1142,7 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
             push_txt = (f" [Push:{h['prob_push']:.0f}%]" if h["prob_push"] > 2 else "")
 
-            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd ~{h['odd_fair']}){push_txt}")
+            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd mín. {h['odd_fair']}){push_txt}")
 
         linhas.append("")
 
@@ -1190,7 +1154,7 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
             push_txt = (f" [Push:{h['prob_push']:.0f}%]" if h["prob_push"] > 2 else "")
 
-            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd ~{h['odd_fair']}){push_txt}")
+            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd mín. {h['odd_fair']}){push_txt}")
 
         linhas.append("")
 
@@ -1680,97 +1644,49 @@ def extrair_metricas_h2h(jogos: list, id_casa: int) -> dict:
 
 
 
-def calcular_forca_times(todos_jogos: list) -> dict:
+# Médias de referência de gols por jogo (ligas de primeira divisão)
+MEDIA_GOLS_CASA_PADRAO = 1.50
+MEDIA_GOLS_FORA_PADRAO = 1.20
+# Quantos "jogos fictícios na média" puxam a força estimada para 1.0.
+# Com só 10 jogos por time, sem isso o modelo exagera (testado em 3.900 jogos reais).
+ENCOLHIMENTO_JOGOS     = 16.0
 
-    xg_marc_casa  = defaultdict(list)
 
-    xg_sofr_casa  = defaultdict(list)
-
-    xg_marc_fora  = defaultdict(list)
-
-    xg_sofr_fora  = defaultdict(list)
-
-    for jogo in todos_jogos:
-
-        try:
-
-            teams = jogo.get("teams", {})
-
-            goals = jogo.get("goals", {})
-
-            stats = jogo.get("statistics", [])
-
-            fix   = jogo.get("fixture", {})
-
-            id_c  = teams.get("home", {}).get("id")
-
-            id_f  = teams.get("away", {}).get("id")
-
-            gc    = goals.get("home")
-
-            gf    = goals.get("away")
-
-            if gc is None or gf is None:
-
-                continue
-
-            gc, gf = int(gc), int(gf)
-
-            w    = peso_temporal(fix.get("date", ""))
-
-            xg_c = extrair_xg_de_stats(stats, id_c) or gc
-
-            xg_f = extrair_xg_de_stats(stats, id_f) or gf
-
-            xg_marc_casa[id_c].append((xg_c, w))
-
-            xg_sofr_casa[id_c].append((xg_f, w))
-
-            xg_marc_fora[id_f].append((xg_f, w))
-
-            xg_sofr_fora[id_f].append((xg_c, w))
-
-        except Exception:
-
+def medias_de_gols(finalizados: list) -> tuple:
+    """Média de gols do mandante e do visitante, puxada para o padrão."""
+    gc = gf = n = 0
+    for j in finalizados:
+        g = j.get("goals", {})
+        if g.get("home") is None or g.get("away") is None:
             continue
+        gc += int(g["home"]); gf += int(g["away"]); n += 1
+    peso = 30.0
+    mh = (gc + peso * MEDIA_GOLS_CASA_PADRAO) / (n + peso)
+    ma = (gf + peso * MEDIA_GOLS_FORA_PADRAO) / (n + peso)
+    return round(mh, 3), round(ma, 3)
 
-    def mp(lista):
 
-        if not lista: return 1.0
-
-        sv = sum(v * w for v, w in lista)
-
-        sw = sum(w for _, w in lista)
-
-        return sv / sw if sw > 0 else 1.0
-
-    todos_c = [x for lst in xg_marc_casa.values() for x in lst]
-
-    todos_f = [x for lst in xg_marc_fora.values() for x in lst]
-
-    mg_c    = mp(todos_c) or 1.25
-
-    mg_f    = mp(todos_f) or 1.05
-
-    forcas  = {}
-
-    for tid in set(list(xg_marc_casa) + list(xg_marc_fora)):
-
-        ac = mp(xg_marc_casa[tid])
-
-        dc = mp(xg_sofr_casa[tid])
-
-        af = mp(xg_marc_fora[tid])
-
-        df = mp(xg_sofr_fora[tid])
-
-        alpha = ((ac / mg_c) + (af / mg_f)) / 2
-
-        beta  = ((dc / mg_f) + (df / mg_c)) / 2
-
-        forcas[tid] = {"alpha": round(alpha, 3), "beta": round(beta, 3)}
-
-    return forcas
+def calcular_forca_time(jogos: list, team_id: int, media_geral: float) -> dict:
+    """alpha = força de ataque, beta = fragilidade defensiva (1.0 = time médio)."""
+    marc = sofr = peso = 0.0
+    n = 0
+    for j in jogos:
+        teams, goals = j.get("teams", {}), j.get("goals", {})
+        if goals.get("home") is None or goals.get("away") is None:
+            continue
+        eh_casa = teams.get("home", {}).get("id") == team_id
+        gp = int(goals["home"] if eh_casa else goals["away"])
+        gs = int(goals["away"] if eh_casa else goals["home"])
+        w = peso_temporal(j.get("fixture", {}).get("date", ""))
+        marc += gp * w; sofr += gs * w; peso += w; n += 1
+    if n == 0 or peso == 0 or media_geral <= 0:
+        return {"alpha": 1.0, "beta": 1.0, "jogos": 0}
+    k = ENCOLHIMENTO_JOGOS
+    a_bruto = (marc / peso) / media_geral
+    b_bruto = (sofr / peso) / media_geral
+    return {"alpha": round((n * a_bruto + k) / (n + k), 3),
+            "beta":  round((n * b_bruto + k) / (n + k), 3),
+            "jogos": n}
 
 
 
@@ -1942,6 +1858,12 @@ def registrar_snapshot(fixture_id: str, probs: dict) -> None:
 
     snaps[fixture_id] = {"timestamp": datetime.now(timezone.utc).isoformat(), "probs": probs}
 
+    if len(snaps) > 400:
+
+        for k in sorted(snaps, key=lambda k: snaps[k].get("timestamp", ""))[:-400]:
+
+            snaps.pop(k, None)
+
     salvar_snapshots(snaps)
 
 
@@ -1992,94 +1914,43 @@ def detectar_line_movement(fixture_id: str, probs_atuais: dict) -> dict:
 
 # ═══════════════════════════════════════════
 
-GAMMA_CASA = 1.18
-
-GAMMA_SEDE = {"USA": 1.07, "Canada": 1.05, "Mexico": 1.09}
-
-
-
-def calcular_lambdas(mc: dict, mf: dict, forca_c: dict, forca_f: dict,
-
-                     nome_casa: str, dias_desc_c: float, dias_desc_f: float) -> tuple:
-
-    gamma = GAMMA_CASA * GAMMA_SEDE.get(nome_casa, 1.0)
-
-    fd_c  = fator_descanso(dias_desc_c)
-
-    fd_f  = fator_descanso(dias_desc_f)
-
-    if forca_c and forca_f:
-
-        alpha_c = forca_c.get("alpha", 1.0)
-
-        beta_c  = forca_c.get("beta",  1.0)
-
-        alpha_f = forca_f.get("alpha", 1.0)
-
-        beta_f  = forca_f.get("beta",  1.0)
-
-        lc = alpha_c * beta_f * gamma * 1.20 * fd_c
-
-        lf = alpha_f * beta_c / gamma * 1.05 * fd_f
-
-    else:
-
-        xg_c = mc.get("media_xg_marcados", mc.get("media_gols_marcados", 1.2))
-
-        xg_f = mf.get("media_xg_marcados", mf.get("media_gols_marcados", 1.0))
-
-        lc   = xg_c * gamma * fd_c
-
-        lf   = xg_f * fd_f
-
-    return (round(max(0.3, min(4.5, lc)), 3), round(max(0.3, min(4.5, lf)), 3))
+# Ajuste fino do mando de campo (1.0 = só a média real da liga).
+# O autoaprendizado mexe neste valor entre 0.85 e 1.15.
+GAMMA_CASA = 1.0
 
 
+def calcular_lambdas(forca_c: dict, forca_f: dict, media_casa: float, media_fora: float,
+                     dias_desc_c: float, dias_desc_f: float) -> tuple:
+    """Gols esperados: ataque de um x defesa do outro x média da liga (Maher)."""
+    lc = forca_c["alpha"] * forca_f["beta"] * media_casa * GAMMA_CASA * fator_descanso(dias_desc_c)
+    lf = forca_f["alpha"] * forca_c["beta"] * media_fora / GAMMA_CASA * fator_descanso(dias_desc_f)
+    return (round(max(0.2, min(4.0, lc)), 3), round(max(0.2, min(4.0, lf)), 3))
 
-def ensemble(probs_poisson: dict, probs_mc: dict, h2h: dict, fase: str, probs_esc_cart: dict) -> dict:
 
-    ph2h = PESO_H2H_FASE.get(fase, 0.08)
-
+def ensemble(probs_poisson: dict, probs_mc: dict, h2h: dict, fase: str) -> dict:
+    ph2h = PESO_H2H_FASE.get(fase, 0.07) if h2h.get("h2h_jogos", 0) >= 3 else 0.0
     pp   = (1 - ph2h) * 0.60
-
     pm   = (1 - ph2h) * 0.40
 
     def blend(k, h2h_val):
+        return probs_poisson.get(k, 50) * pp + probs_mc.get(k, 50) * pm + h2h_val * ph2h
 
-        return round(probs_poisson.get(k, 50) * pp + probs_mc.get(k, 50) * pm + h2h_val * ph2h, 2)
-
-    h2h_casa   = h2h.get("h2h_aprov_casa", 33)
-
-    h2h_fora   = max(0, 100 - h2h_casa - 28)
-
-    h2h_empate = 28.0
-
-    h2h_btts   = h2h.get("h2h_btts",   50)
-
-    h2h_over25 = h2h.get("h2h_over25", 50)
-
-    resultado = {
-
-        "vitoria_casa":  blend("vitoria_casa",  h2h_casa),
-
-        "empate":        blend("empate",         h2h_empate),
-
-        "vitoria_fora":  blend("vitoria_fora",  h2h_fora),
-
-        "btts":          blend("btts",           h2h_btts),
-
-        "over25":        blend("over25",         h2h_over25),
-
-        "under25":       probs_poisson.get("under25", 50),
-
-        "over15":        probs_poisson.get("over15",  50),
-
+    h2h_casa = h2h.get("h2h_aprov_casa", 33)
+    vc = blend("vitoria_casa", h2h_casa)
+    em = blend("empate", 27.0)
+    vf = blend("vitoria_fora", max(0.0, 100 - h2h_casa - 27))
+    soma = vc + em + vf or 1.0
+    over25 = blend("over25", h2h.get("h2h_over25", 50))
+    return {
+        # 1X2 sempre soma 100%; Over/Under 2.5 sempre somam 100%
+        "vitoria_casa": round(vc / soma * 100, 2),
+        "empate":       round(em / soma * 100, 2),
+        "vitoria_fora": round(vf / soma * 100, 2),
+        "btts":         round(blend("btts", h2h.get("h2h_btts", 50)), 2),
+        "over25":       round(over25, 2),
+        "under25":      round(100 - over25, 2),
+        "over15":       round(probs_poisson.get("over15", 50), 2),
     }
-
-    resultado.update(probs_esc_cart)
-
-    return resultado
-
 
 
 def aplicar_platt_todos(probs: dict, platt_params: dict) -> dict:
@@ -2186,7 +2057,7 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
     mercados_ok.sort(key=lambda x: -x["prob"])
 
-    if not mercados_ok and not ha_resultado:
+    if not mercados_ok and not (ha_resultado or {}).get("recomendada"):
 
         return ""
 
@@ -2251,11 +2122,9 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
         f"   Poisson + Dixon-Coles + Monte Carlo",
 
-        f"   Dados: {xg_tag} | Platt Scaling v6.1",
+        f"   Dados: {xg_tag}",
 
-        f"   λ({nc})={lc} | λ({nf})={lf}",
-
-        f"   λ_esc={lc_esc}/{lf_esc} | MC={MONTE_CARLO_N:,} sims",
+        f"   Gols esperados: {nc} {lc} x {lf} {nf}",
 
     ]
 
@@ -2280,16 +2149,31 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
         xg_m = met.get("media_xg_marcados", met.get("media_gols_marcados","?"))
 
         xg_s = met.get("media_xg_sofridos", met.get("media_gols_sofridos","?"))
-        f_atk= fc.get("fator_ataque", 1.0)
-        f_def= fc.get("fator_defesa", 1.0)
+        f_atk= fc.get("alpha", 1.0)
+        f_def= fc.get("beta", 1.0)
         linhas.append(f"  {nome}: {n_j}J | xG+: {xg_m} | xG-: {xg_s}")
-        linhas.append(f"    Força Atk: {f_atk} | Força Def: {f_def}")
+        linhas.append(f"    Ataque: {f_atk} | Defesa (vaza): {f_def}  (1.0 = time médio)")
     
     return "\n".join(linhas)
 
 # RESUMO DIÁRIO
 
 # ═══════════════════════════════════════════
+
+def taxa_por_mercado(log: list, prob_minima: float = None) -> tuple:
+    """(acertos, total) contando cada mercado indicado separadamente."""
+    lim = PROB_MINIMA if prob_minima is None else prob_minima
+    acertos = total = 0
+    for e in log:
+        res = inferir_resultado_real(e)
+        if not res:
+            continue
+        for m, prob in e.get("probs_calibradas", {}).items():
+            if prob >= lim and m in res:
+                total += 1
+                acertos += res[m]
+    return acertos, total
+
 
 def enviar_resumo_diario(jogos: list) -> None:
 
@@ -2299,9 +2183,7 @@ def enviar_resumo_diario(jogos: list) -> None:
 
     log      = carregar_log()
 
-    acertos  = sum(1 for e in log if e.get("resultado") == "acerto")
-
-    total_log= len([e for e in log if e.get("resultado")])
+    acertos, total_log = taxa_por_mercado(log)
 
     SEP      = "━" * 34
 
@@ -2325,7 +2207,7 @@ def enviar_resumo_diario(jogos: list) -> None:
 
         linhas += [SEP, "📊 DESEMPENHO ACUMULADO", SEP,
 
-                   f"Taxa de acerto : {taxa}%", f"Indicações     : {acertos}/{total_log} certas"]
+                   f"Taxa de acerto : {taxa}%", f"Indicações     : {acertos}/{total_log} certas (por mercado)"]
 
     linhas += ["", SEP, "🔬 Motor: Poisson+MC+Dixon-Coles+Platt+HA v7.0", "Análises serão enviadas antes de cada jogo."]
 
@@ -2654,7 +2536,7 @@ def eh_hora_relatorio_semanal() -> bool:
 
     brt = agora_brt()
 
-    return brt.weekday() == 6 and brt.hour == 9 and brt.minute < 30
+    return brt.weekday() == 6 and 9 <= brt.hour < 14
 
 
 
@@ -2758,7 +2640,7 @@ def carregar_params_modelo() -> dict:
 
         "rho_dixon_coles": RHO_DIXON_COLES, "lambda_decay": LAMBDA_DECAY,
 
-        "peso_poisson": 0.60, "peso_mc": 0.40, "gamma_casa": GAMMA_CASA,
+        "peso_poisson": 0.60, "peso_mc": 0.40, "fator_casa": 1.0, "motor": 7,
 
         "prob_minima": float(PROB_MINIMA), "versao": 1, "jogos_treinados": 0,
 
@@ -2774,7 +2656,11 @@ def carregar_params_modelo() -> dict:
 
                 saved = json.load(f)
 
-            defaults.update(saved)
+            if saved.get("motor") == 7:
+                defaults.update(saved)
+            else:
+                # parâmetros do motor antigo (Copa) não servem para o motor novo
+                print("  🧠 Parâmetros do modelo antigo descartados (motor v7)")
 
     except Exception as e:
 
@@ -2793,7 +2679,7 @@ def aplicar_params_globais(params: dict) -> None:
     RHO_DIXON_COLES = params.get("rho_dixon_coles", RHO_DIXON_COLES)
     PROB_MINIMA     = params.get("prob_minima", PROB_MINIMA)
     LAMBDA_DECAY    = params.get("lambda_decay", LAMBDA_DECAY)
-    GAMMA_CASA      = params.get("gamma_casa", GAMMA_CASA)
+    GAMMA_CASA      = params.get("fator_casa", 1.0)
 
 
 
@@ -2850,8 +2736,9 @@ def inferir_resultado_real(entrada: dict) -> dict:
         gc, gf = map(int, placar.split("-"))
 
         return {"vitoria_casa": int(gc > gf), "empate": int(gc == gf),
-
-                "vitoria_fora": int(gc < gf), "btts": int(gc > 0 and gf > 0), "over25": int(gc + gf > 2)}
+                "vitoria_fora": int(gc < gf), "btts": int(gc > 0 and gf > 0),
+                "over25": int(gc + gf > 2), "under25": int(gc + gf <= 2),
+                "over15": int(gc + gf > 1)}
 
     except Exception:
 
@@ -2875,7 +2762,9 @@ def analisar_erros_sistematicos(log: list) -> dict:
 
         for mercado, prob in probs.items():
 
-            dados_por_mercado[mercado].append((prob / 100, float(res.get(mercado, 0))))
+            if mercado not in res: continue
+
+            dados_por_mercado[mercado].append((prob / 100, float(res[mercado])))
 
     analise = {}
 
@@ -2904,19 +2793,13 @@ def ajustar_parametros_modelo(params: dict, erros: dict, log: list) -> tuple:
     novos = params.copy(); ajustes_feitos = []
 
     vies_casa = erros.get("vitoria_casa", {}).get("vies", 0)
-
-    if abs(vies_casa) > 5.0:
-
-        delta      = max(-0.05, min(0.05, -vies_casa * 0.003))
-
-        novo_gamma = max(1.05, min(1.35, round(novos["gamma_casa"] + delta, 3)))
-
-        if novo_gamma != novos["gamma_casa"]:
-
-            ajustes_feitos.append(f"gamma_casa: {novos['gamma_casa']} → {novo_gamma} (viés vitória_casa={vies_casa:+.1f}%)")
-
-            novos["gamma_casa"] = novo_gamma
-
+    if abs(vies_casa) > 5.0 and erros.get("vitoria_casa", {}).get("n", 0) >= 20:
+        atual      = novos.get("fator_casa", 1.0)
+        delta      = max(-0.03, min(0.03, -vies_casa * 0.002))
+        novo_fator = max(0.85, min(1.15, round(atual + delta, 3)))
+        if novo_fator != atual:
+            ajustes_feitos.append(f"fator_casa: {atual} → {novo_fator} (viés vitória_casa={vies_casa:+.1f}%)")
+            novos["fator_casa"] = novo_fator
     placares_baixos = total_jogos = 0
 
     for e in log:
@@ -2949,29 +2832,26 @@ def ajustar_parametros_modelo(params: dict, erros: dict, log: list) -> tuple:
 
             novos["rho_dixon_coles"] = novo_rho
 
-    total   = sum(1 for e in log if e.get("resultado") is not None)
-
-    acertos = sum(1 for e in log if e.get("resultado") == "acerto")
-
-    if total >= 8:
-
-        taxa = acertos / total
-
-        if taxa < 0.52 and novos["prob_minima"] < 72:
-
+    # Calibração: o que o modelo prometeu nas indicações x o que aconteceu
+    lim = novos["prob_minima"]
+    prometido = []; aconteceu = []
+    for e in log:
+        res = inferir_resultado_real(e)
+        for m, prob in e.get("probs_calibradas", {}).items():
+            if prob >= lim and m in res:
+                prometido.append(prob); aconteceu.append(res[m] * 100)
+    total = len(prometido)
+    if total >= 30:
+        gap = sum(prometido) / total - sum(aconteceu) / total
+        if gap > 5 and novos["prob_minima"] < 72:
             novo_min = round(min(72.0, novos["prob_minima"] + 1.0), 1)
-
-            ajustes_feitos.append(f"prob_minima: {novos['prob_minima']}% → {novo_min}% (taxa={taxa:.1%})")
-
+            ajustes_feitos.append(f"prob_minima: {novos['prob_minima']}% → {novo_min}% (modelo otimista {gap:+.1f}%)")
             novos["prob_minima"] = novo_min
-
-        elif taxa > 0.72 and novos["prob_minima"] > 55:
-
+        elif gap < -5 and novos["prob_minima"] > 55:
             novo_min = round(max(55.0, novos["prob_minima"] - 0.5), 1)
-
-            ajustes_feitos.append(f"prob_minima: {novos['prob_minima']}% → {novo_min}% (taxa={taxa:.1%})")
-
+            ajustes_feitos.append(f"prob_minima: {novos['prob_minima']}% → {novo_min}% (modelo pessimista {gap:+.1f}%)")
             novos["prob_minima"] = novo_min
+    total = sum(1 for e in log if e.get("resultado") is not None)
 
     if ajustes_feitos:
 
@@ -3037,11 +2917,13 @@ def executar_autoaprendizado(params_atuais: dict) -> dict:
 
 # ───────────────────────────────────────────
 
-print("🔬 Treinando calibração Platt Scaling...")
+# Platt DESLIGADO: os "dados das Copas" não tinham o resultado real de BTTS/Over
+# (os rótulos eram calculados a partir do próprio lambda). No teste com 3.900 jogos
+# reais ele distorcia tudo: BTTS caía de ~50% para ~15%, Over 2.5 subia para ~70%.
+# A calibração passa a vir só do autoaprendizado com resultados reais.
 
-PLATT_PARAMS = treinar_platt(HISTORICO_COPAS)
+PLATT_PARAMS = {}
 
-print(f"✅ Parâmetros calibrados para {len(PLATT_PARAMS)} mercados")
 
 
 
@@ -3051,257 +2933,136 @@ print(f"✅ Parâmetros calibrados para {len(PLATT_PARAMS)} mercados")
 
 # ═══════════════════════════════════════════
 
+def calcular_probabilidades(jogo: dict, jogos_c: list, jogos_f: list, jogos_h2h: list,
+                            jogos_finalizados: list, desf_c: dict = None, desf_f: dict = None) -> dict:
+    """Todo o modelo, sem rede: recebe os jogos e devolve as probabilidades."""
+    teams = jogo.get("teams", {})
+    id_c  = teams.get("home", {}).get("id")
+    id_f  = teams.get("away", {}).get("id")
+    data_jogo = jogo.get("fixture", {}).get("date", "")
+    fase  = FASES.get(jogo.get("league", {}).get("round", ""), "fase_grupos")
+
+    mc  = extrair_metricas(jogos_c, id_c)
+    mf  = extrair_metricas(jogos_f, id_f)
+    h2h = extrair_metricas_h2h(jogos_h2h, id_c)
+    dias_c = calcular_dias_descanso(jogos_c, data_jogo)
+    dias_f = calcular_dias_descanso(jogos_f, data_jogo)
+
+    mh, ma  = medias_de_gols(jogos_finalizados)
+    media   = (mh + ma) / 2
+    forca_c = calcular_forca_time(jogos_c, id_c, media)
+    forca_f = calcular_forca_time(jogos_f, id_f, media)
+
+    lc, lf = calcular_lambdas(forca_c, forca_f, mh, ma, dias_c, dias_f)
+    if desf_c and desf_f:
+        lc = round(lc * desf_c["fator_ataque"] * desf_f["fator_defesa"], 3)
+        lf = round(lf * desf_f["fator_ataque"] * desf_c["fator_defesa"], 3)
+
+    placares      = matriz_placares(lc, lf)
+    probs_poisson = derivar_mercados_poisson(placares)
+    probs_mc      = monte_carlo(lc, lf, MONTE_CARLO_N)
+    probs_cal     = aplicar_platt_todos(ensemble(probs_poisson, probs_mc, h2h, fase), PLATT_PARAMS)
+    return {
+        "mc": mc, "mf": mf, "h2h": h2h, "dias_c": dias_c, "dias_f": dias_f,
+        "forca_c": forca_c, "forca_f": forca_f, "lc": lc, "lf": lf, "fase": fase,
+        "probs_poisson": probs_poisson, "probs_mc": probs_mc, "probs_cal": probs_cal,
+        "ha_resultado": selecionar_melhor_handicap(placares, lc, lf),
+        "tem_xg": mc.get("tem_xg", False) or mf.get("tem_xg", False),
+    }
+
+
 def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list) -> tuple:
 
-    fix      = jogo.get("fixture", {})
-
-    teams    = jogo.get("teams",   {})
-
-    league   = jogo.get("league",  {})
-
-    fid      = str(fix.get("id", ""))
-
-    nc       = teams.get("home", {}).get("name", "?")
-
-    nf       = teams.get("away", {}).get("name", "?")
-
-    id_c     = teams.get("home", {}).get("id")
-
-    id_f     = teams.get("away", {}).get("id")
-
-    data_jogo= fix.get("date", "")
-
-    fase     = FASES.get(league.get("round","Group Stage"), "fase_grupos")
+    fix   = jogo.get("fixture", {})
+    teams = jogo.get("teams",   {})
+    league = jogo.get("league", {})
+    fid   = str(fix.get("id", ""))
+    nc    = teams.get("home", {}).get("name", "?")
+    nf    = teams.get("away", {}).get("name", "?")
+    id_c  = teams.get("home", {}).get("id")
+    id_f  = teams.get("away", {}).get("id")
 
     if not fid or not id_c or not id_f:
-
         return budget, cache
-
     if no_cache(fid, cache):
-
         print(f"  [CACHE] {nc} vs {nf}")
-
         return budget, cache
-
-    print(f"\n  ⚽ {nc} vs {nf} [{fase.replace('_',' ').title()}]")
-
     if calls_disponiveis(budget) < CALLS_POR_JOGO + BUDGET_EMERGENCIA:
-
         print("  ⚠️  Budget insuficiente.")
-
         return budget, cache
 
-    print(f"    🏆 {LIGAS.get(league.get('id'), league.get('name', ''))}")
+    print(f"\n  ⚽ {nc} vs {nf} | {LIGAS.get(league.get('id'), league.get('name', ''))}")
 
     jogos_c, budget = buscar_historico_completo(id_c, nc, budget)
-
-    time.sleep(1)
-
     jogos_f, budget = buscar_historico_completo(id_f, nf, budget)
-
-    time.sleep(1)
-
-    if not jogos_c or not jogos_f:
-
-        print("  [SEM DADOS]")
-
-        return budget, cache
+    if len(jogos_c) < 4 or len(jogos_f) < 4:
+        print("  [SEM DADOS SUFICIENTES] — não será reanalisado hoje")
+        return budget, add_cache(fid, cache)
 
     jogos_h2h, budget = buscar_h2h(id_c, id_f, JOGOS_H2H, budget)
 
-    time.sleep(0.5)
+    desf_c = desf_f = None
+    lesoes, budget = buscar_desfalques(int(fid), budget)
+    if lesoes:
+        desf_c = calcular_impacto_desfalques(lesoes, id_c)
+        desf_f = calcular_impacto_desfalques(lesoes, id_f)
 
-    mc  = extrair_metricas(jogos_c, id_c)
+    r = calcular_probabilidades(jogo, jogos_c, jogos_f, jogos_h2h, jogos_finalizados, desf_c, desf_f)
+    probs_cal = r["probs_cal"]
+    vazio = {"ausentes": [], "total_ausentes": 0}
+    desf_c, desf_f = desf_c or vazio, desf_f or vazio
 
-    mf  = extrair_metricas(jogos_f, id_f)
-
-    h2h = extrair_metricas_h2h(jogos_h2h, id_c)
-
-    if not mc or not mf:
-
-        print("  [SEM MÉTRICAS]")
-
-        return budget, cache
-
-    tem_xg = mc.get("tem_xg", False) or mf.get("tem_xg", False)
-
-    dias_c = calcular_dias_descanso(jogos_c, data_jogo)
-
-    dias_f = calcular_dias_descanso(jogos_f, data_jogo)
-
-    forcas  = calcular_forca_times(jogos_finalizados + jogos_c + jogos_f)
-
-    forca_c = forcas.get(id_c, {"alpha": 1.0, "beta": 1.0})
-
-    forca_f = forcas.get(id_f, {"alpha": 1.0, "beta": 1.0})
-
-
-
-    lc, lf  = calcular_lambdas(mc, mf, forca_c, forca_f, nc, dias_c, dias_f)
-
-    lc_esc, lf_esc   = calcular_lambda_escanteios(mc, mf, fase)
-
-    lc_cart, lf_cart = calcular_lambda_cartoes(mc, mf, fase)
-
-    placares      = matriz_placares(lc, lf)
-
-    probs_poisson = derivar_mercados_poisson(placares)
-
-    print(f"    🎲 Monte Carlo ({MONTE_CARLO_N:,} simulações)...")
-
-    probs_mc = monte_carlo(lc, lf, MONTE_CARLO_N)
-
-    probs_esp = {
-
-        "escanteios": prob_escanteios_over(lc_esc, lf_esc, 9.5),
-
-        "cartoes":    prob_cartoes_over(lc_cart, lf_cart, 3.5),
-
-    }
-
-    probs_ens    = ensemble(probs_poisson, probs_mc, h2h, fase, probs_esp)
-
-    probs_cal    = aplicar_platt_todos(probs_ens, PLATT_PARAMS)
-
-    print(f"    🎲 Calculando Handicap Asiático...")
-
-    ha_resultado = selecionar_melhor_handicap(placares, lc, lf)
-
-    movimentos   = detectar_line_movement(fid, probs_cal)
-
+    movimentos = detectar_line_movement(fid, probs_cal)
     registrar_snapshot(fid, probs_cal)
-
     score, nivel_score, det_score = calcular_score_confianca(
-
-        probs_cal, probs_poisson, probs_mc, mc, mf, h2h, tem_xg, dias_c, dias_f, movimentos)
-
-    print(f"    📊 Score: {score}/100 — {nivel_score}")
-
-    desf_c = {"ausentes": [], "fator_ataque": 1.0, "fator_defesa": 1.0, "total_ausentes": 0}
-
-    desf_f = {"ausentes": [], "fator_ataque": 1.0, "fator_defesa": 1.0, "total_ausentes": 0}
-
-    if calls_disponiveis(budget) >= 2 + BUDGET_EMERGENCIA:
-
-        lesoes, budget = buscar_desfalques(int(fid), budget)
-
-        if lesoes:
-
-            desf_c = calcular_impacto_desfalques(lesoes, id_c)
-
-            desf_f = calcular_impacto_desfalques(lesoes, id_f)
-
-            if desf_c["total_ausentes"] > 0 or desf_f["total_ausentes"] > 0:
-
-                lc_adj = round(lc * desf_c["fator_ataque"] * desf_f["fator_defesa"], 3)
-
-                lf_adj = round(lf * desf_f["fator_ataque"] * desf_c["fator_defesa"], 3)
-
-                if lc_adj != lc or lf_adj != lf:
-
-                    print(f"    🔧 Ajuste desfalques: λc {lc}→{lc_adj} λf {lf}→{lf_adj}")
-
-                    placares2  = matriz_placares(lc_adj, lf_adj)
-
-                    probs_p2   = derivar_mercados_poisson(placares2)
-
-                    probs_mc2  = monte_carlo(lc_adj, lf_adj, MONTE_CARLO_N)
-
-                    probs_ens2 = ensemble(probs_p2, probs_mc2, h2h, fase, probs_esp)
-
-                    probs_cal  = aplicar_platt_todos(probs_ens2, PLATT_PARAMS)
-
-                    ha_resultado = selecionar_melhor_handicap(placares2, lc_adj, lf_adj)
-
-                    lc, lf = lc_adj, lf_adj
+        probs_cal, r["probs_poisson"], r["probs_mc"], r["mc"], r["mf"], r["h2h"],
+        r["tem_xg"], r["dias_c"], r["dias_f"], movimentos)
+    print(f"    λ {r['lc']} x {r['lf']} | Score {score}/100")
 
     # Odds REAIS das casas. Sem odd real não existe value bet: nada é estimado.
     odds_reais, budget = buscar_odds_reais(int(fid), budget)
-
     value_bets = calcular_value_bets(probs_cal, odds_reais) if odds_reais else []
-
     if odds_reais:
-
         bloco_vb = montar_bloco_value_bets(value_bets) or (
             "\n" + "━" * 34 + "\n💎 Odds reais conferidas: nenhuma value bet acima de 3%.")
-
     else:
-
         bloco_vb = ("\n" + "━" * 34 + "\n💎 Sem odds reais das casas para este jogo "
                     "— value bet não calculada.")
-
     melhor_odd = {m: max(c.values()) for m, c in odds_reais.items() if c}
 
     alerta = montar_alerta(
-
-        jogo, probs_cal, mc, mf, h2h, fase, lc, lf, forca_c, forca_f,
-
-        movimentos, dias_c, dias_f, lc_esc, lf_esc, tem_xg, ha_resultado,
-
-    )
+        jogo, probs_cal, r["mc"], r["mf"], r["h2h"], r["fase"], r["lc"], r["lf"],
+        r["forca_c"], r["forca_f"], movimentos, r["dias_c"], r["dias_f"],
+        None, None, r["tem_xg"], r["ha_resultado"])
 
     if alerta:
-
-        score_bloco = (
-
-            f"\n{'─'*34}\n🎯 SCORE DE CONFIANÇA: {score}/100\n{nivel_score}\n"
-
-            + "\n".join(f"  {d}" for d in det_score)
-
-        )
-
+        score_bloco = (f"\n{'─'*34}\n🎯 SCORE DE CONFIANÇA: {score}/100\n{nivel_score}\n"
+                       + "\n".join(f"  {d}" for d in det_score))
         desf_bloco = ""
-
-        if desf_c["total_ausentes"] > 0 or desf_f["total_ausentes"] > 0:
-
+        if desf_c["total_ausentes"] or desf_f["total_ausentes"]:
             desf_bloco = f"\n{'─'*34}\n🏥 DESFALQUES:\n"
-
             if desf_c["ausentes"]: desf_bloco += f"  {nc}: {', '.join(desf_c['ausentes'][:3])}\n"
-
             if desf_f["ausentes"]: desf_bloco += f"  {nf}: {', '.join(desf_f['ausentes'][:3])}\n"
-
         enviar_telegram(alerta + score_bloco + desf_bloco + bloco_vb)
-
-        # FIX #3: print completo
-
-        n_linhas_ha = len(ha_resultado.get('melhores_casa', [])) + len(ha_resultado.get('melhores_fora', []))
-
-        print(f"    ✅ Alerta enviado! Score={score}/100 | HA={n_linhas_ha} linhas")
-
+        print("    ✅ Alerta enviado!")
         salvar_log({
-
             "data": datetime.now().isoformat(), "fixture_id": fid,
-
-            "casa": nc, "fora": nf, "fase": fase,
-
-            "lambda_c": lc, "lambda_f": lf, "tem_xg": tem_xg,
-
-            "dias_desc_c": dias_c, "dias_desc_f": dias_f,
-
+            "casa": nc, "fora": nf, "fase": r["fase"],
+            "liga": LIGAS.get(league.get("id"), ""),
+            "lambda_c": r["lc"], "lambda_f": r["lf"], "tem_xg": r["tem_xg"],
+            "dias_desc_c": r["dias_c"], "dias_desc_f": r["dias_f"],
             "score_confianca": score,
-
             "desfalques_casa": desf_c["ausentes"], "desfalques_fora": desf_f["ausentes"],
-
-            "probs_poisson": probs_poisson, "probs_mc": probs_mc, "probs_calibradas": probs_cal,
-
-            "handicap_recomendado": ha_resultado.get("recomendada"),
-
+            "probs_poisson": r["probs_poisson"], "probs_mc": r["probs_mc"], "probs_calibradas": probs_cal,
+            "handicap_recomendado": r["ha_resultado"].get("recomendada"),
             "value_bets": [v["mercado"] for v in value_bets[:3]],
-
-            "liga": LIGAS.get(jogo.get("league", {}).get("id"), ""),
-
             "odds_reais": melhor_odd,
-
             "line_movement": movimentos, "resultado": None, "placar_real": None,
-
         })
-
     else:
-
-        print(f"    ⚠️  Nenhum mercado ≥ {PROB_MINIMA}% (score={score}/100)")
+        print(f"    ⚠️  Nenhum mercado ≥ {PROB_MINIMA}%")
 
     cache = add_cache(fid, cache)
-
     return budget, cache
 
 
@@ -3326,7 +3087,12 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     aplicar_params_globais(params_modelo)
 
-    agora   = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    # Virada do dia: zera o orçamento (antes ficava travado depois do 1º dia)
+    if budget.get("data") != hoje_utc():
+        budget = {"data": hoje_utc(), "calls_usadas": 0}
+        salvar_budget(budget)
+
+    agora   = agora_brt().strftime("%d/%m/%Y %H:%M:%S")
 
     disponi = calls_disponiveis(budget)
 
@@ -3358,13 +3124,17 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     hoje = agora_brt().strftime("%Y-%m-%d")
 
-    if eh_hora_resumo() and resumo_hoje != hoje:
+    estado = _carregar_estado_envios()
+
+    if eh_hora_resumo() and estado.get("resumo") != hoje:
 
         jogos_hoje = [j for j in jogos if formatar_brt(j.get("fixture",{}).get("date","")).startswith(agora_brt().strftime("%d/%m"))]
 
         enviar_resumo_diario(jogos_hoje)
 
-        resumo_hoje = hoje
+        estado["resumo"] = hoje
+
+        _salvar_estado_envios(estado)
 
     for jogo in jogos:
 
@@ -3374,7 +3144,15 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
             break
 
-        budget, cache = analisar_jogo(jogo, budget, cache, finalizados)
+        try:
+            budget, cache = analisar_jogo(jogo, budget, cache, finalizados)
+        except Exception as e:
+            # um jogo com dado estranho não pode derrubar o ciclo nem ser
+            # reanalisado a cada 30 min gastando cota
+            fid = str(jogo.get("fixture", {}).get("id", ""))
+            print(f"  [ERRO jogo {fid}] {type(e).__name__}: {e}")
+            if fid:
+                cache = add_cache(fid, cache)
 
     log_atual = carregar_log()
 
@@ -3398,13 +3176,15 @@ def rodar_ciclo(budget: dict, cache: dict, params_modelo: dict) -> tuple:
 
     hoje_str = agora_brt().strftime("%Y-%m-%d")
 
-    if eh_hora_relatorio_semanal() and relatorio_semanal_enviado != hoje_str:
+    if eh_hora_relatorio_semanal() and estado.get("semanal") != hoje_str:
 
         rel_sem = gerar_relatorio_semanal(carregar_log(), jogos)
 
         if rel_sem: enviar_telegram(rel_sem)
 
-        relatorio_semanal_enviado = hoje_str
+        estado["semanal"] = hoje_str
+
+        _salvar_estado_envios(estado)
 
     params_modelo = executar_autoaprendizado(params_modelo)
 
@@ -3446,13 +3226,12 @@ if __name__ == "__main__":
 
     print("║  [2]  Monte Carlo — 100.000 simulações/jogo        ║")
 
-    print("║  [3]  Platt Scaling — calibração Copas 18+22       ║")
+    print("║  [3]  Força ataque/defesa (Maher) + encolhimento   ║")
 
     print("║  [4]  xG (Expected Goals)                          ║")
 
     print("║  [5]  Variáveis contextuais (descanso, fase)       ║")
 
-    print("║  [6]  Poisson escanteios e cartões                 ║")
 
     print("║  [7]  Variação das probabilidades do modelo        ║")
 
@@ -3470,7 +3249,7 @@ if __name__ == "__main__":
 
     print("║  [14] Autoaprendizado online                       ║")
 
-    print("║  [15] 🎲 HANDICAP ASIÁTICO — NOVO v6.1            ║")
+    print("║  [15] Handicap asiático                            ║")
 
     print("╚══════════════════════════════════════════════════════╝\n")
 
@@ -3508,11 +3287,11 @@ if __name__ == "__main__":
 
         "  🎲 Monte Carlo 100k simulações\n  📊 xG (Expected Goals)\n"
 
-        "  🎯 Platt Scaling calibrado\n  💤 Fator descanso entre jogos\n"
+        "  💪 Força ataque/defesa por time\n  💤 Fator descanso entre jogos\n"
 
-        "  🚩 Poisson dedicado escanteios\n  🔄 Variação do modelo\n"
+        "  🔄 Variação do modelo\n"
 
-        "  🔀 Ensemble 8 módulos\n  📊 Score de confiança 0-100\n"
+        "  📊 Score de confiança 0-100\n"
 
         "  🏥 Lesões e desfalques\n  💎 Value Bet multi-casa\n"
 
