@@ -175,7 +175,7 @@ LIGAS = {
 HORAS_ANTECEDENCIA = 24
 
 # Chamadas por jogo analisado: histórico casa, histórico fora, H2H, odds, desfalques
-CALLS_POR_JOGO = 7   # + até 2 buscas de estatísticas (chutes/escanteios)
+CALLS_POR_JOGO = 9   # histórico (até 2 por time) + 2 estatísticas + H2H + desfalques + odds
 
 # Plano grátis: sem busca em lote, cada jogo custa 1 chamada. Teto por dia:
 ESTATS_MAX_DIA = int(os.getenv("ESTATS_MAX_DIA", "20"))
@@ -836,21 +836,56 @@ def placar_90min(jogo: dict) -> dict:
     return jogo
 
 
-def buscar_ultimos_jogos(team_id: int, qtd: int, budget: dict):
-    # Todas as competições: um time na Champions também tem jogos na liga nacional
-    dados, budget = api_get("fixtures", {"team": team_id, "last": qtd}, budget)
-    return [placar_90min(j) for j in dados or []], budget
+_FIM = ("FT", "AET", "PEN")
+
+_cache_temporada = {}      # (time, temporada) -> (timestamp, jogos)
+
+
+def _jogos_da_temporada(team_id: int, season: int, budget: dict):
+    """Todos os jogos do time na temporada (todas as competições), com cache de 12h.
+
+    O plano grátis não aceita o parâmetro "last"; "team + season" é aceito e custa
+    a mesma 1 chamada.
+    """
+    chave = (team_id, season)
+    item = _cache_temporada.get(chave)
+    # resposta vazia (temporada bloqueada/falha) fica 3h em cache; com jogos, 12h
+    if item and time.time() - item[0] < (12 if item[1] else 3) * 3600:
+        return item[1], budget
+    dados, budget = api_get("fixtures", {"team": team_id, "season": season}, budget)
+    jogos = [placar_90min(j) for j in dados or []
+             if j.get("fixture", {}).get("status", {}).get("short") in _FIM]
+    _cache_temporada[chave] = (time.time(), jogos)
+    return jogos, budget
+
+
+def buscar_ultimos_jogos(team_id: int, qtd: int, budget: dict, season: int = None):
+    """Os `qtd` jogos encerrados mais recentes do time (todas as competições)."""
+    season = season or datetime.now(timezone.utc).year
+    jogos, budget = _jogos_da_temporada(team_id, season, budget)
+    # começo de temporada (menos de 10 jogos): completa com a temporada anterior
+    if len(jogos) < 10 and calls_disponiveis(budget) > CALLS_POR_JOGO + BUDGET_EMERGENCIA:
+        anteriores, budget = _jogos_da_temporada(team_id, season - 1, budget)
+        jogos = jogos + anteriores
+    vistos, unicos = set(), []
+    for j in sorted(jogos, key=lambda j: j.get("fixture", {}).get("date", ""), reverse=True):
+        fid = j.get("fixture", {}).get("id")
+        if fid not in vistos:
+            vistos.add(fid); unicos.append(j)
+    return unicos[:qtd], budget
 
 
 def buscar_h2h(id1: int, id2: int, qtd: int, budget: dict):
-    dados, budget = api_get("fixtures/headtohead", {
-        "h2h": f"{id1}-{id2}", "last": qtd,
-    }, budget)
-    return [placar_90min(j) for j in dados or []], budget
+    # sem "last" (bloqueado no plano grátis): pega todos e fica com os mais recentes
+    dados, budget = api_get("fixtures/headtohead", {"h2h": f"{id1}-{id2}"}, budget)
+    jogos = [placar_90min(j) for j in dados or []
+             if j.get("fixture", {}).get("status", {}).get("short") in _FIM]
+    jogos.sort(key=lambda j: j.get("fixture", {}).get("date", ""), reverse=True)
+    return jogos[:qtd], budget
 
 
-def buscar_historico_completo(team_id: int, nome: str, budget: dict):
-    jogos, budget = buscar_ultimos_jogos(team_id, JOGOS_HISTORICO, budget)
+def buscar_historico_completo(team_id: int, nome: str, budget: dict, season: int = None):
+    jogos, budget = buscar_ultimos_jogos(team_id, JOGOS_HISTORICO, budget, season)
     jogos = [j for j in jogos
              if j.get("goals", {}).get("home") is not None
              and j.get("goals", {}).get("away") is not None]
@@ -3282,8 +3317,9 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
 
     print(f"\n  ⚽ {nc} vs {nf} | {LIGAS.get(league.get('id'), league.get('name', ''))}")
 
-    jogos_c, budget = buscar_historico_completo(id_c, nc, budget)
-    jogos_f, budget = buscar_historico_completo(id_f, nf, budget)
+    season = league.get("season")
+    jogos_c, budget = buscar_historico_completo(id_c, nc, budget, season)
+    jogos_f, budget = buscar_historico_completo(id_f, nf, budget, season)
     if len(jogos_c) < 4 or len(jogos_f) < 4:
         print("  [SEM DADOS SUFICIENTES] — não será reanalisado hoje")
         return budget, add_cache(fid, cache)

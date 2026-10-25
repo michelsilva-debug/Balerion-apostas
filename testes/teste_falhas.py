@@ -65,6 +65,9 @@ def fake_get(url, headers=None, params=None, timeout=None):
             return R([fx(100, 71, 10, 11, agora - timedelta(hours=20), "FT", (1, 1))])
         return R([fx(7, 4000, 1, 2, agora + timedelta(days=1))])
     if ep == "fixtures" and "team" in p:
+        if "last" in p:
+            return R([], errors={"plan": "Free plans do not have access to the Last parameter."})
+        assert "season" in p, "histórico deve vir por temporada"
         t = p["team"]
         if t in (500, 501):
             return R([])
@@ -79,6 +82,7 @@ def fake_get(url, headers=None, params=None, timeout=None):
         return R([{"team": {"id": casa}, "statistics": [{"type": "Shots on Goal", "value": 4}, {"type": "Corner Kicks", "value": 5}]},
                   {"team": {"id": fora}, "statistics": [{"type": "Shots on Goal", "value": 2}, {"type": "Corner Kicks", "value": 3}]}])
     if ep == "fixtures/headtohead":
+        assert "last" not in p, "plano grátis não aceita last no H2H"
         return R([])
     if ep == "odds":
         return R([])
