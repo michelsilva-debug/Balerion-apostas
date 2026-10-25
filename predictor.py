@@ -98,11 +98,16 @@ APIFOOTBALL_KEY  = os.getenv("APIFOOTBALL_KEY")
 
 PROB_MINIMA          = 58
 
-EDGE_MINIMO          = 3.5
 
 KELLY_FRACAO         = 0.20
 
-BANCA_PADRAO         = 1000
+BANCA_PADRAO         = float(os.getenv("BANCA", "1000"))
+
+# Value mínimo (EV) para registrar uma divergência modelo x casa
+VALUE_MINIMO         = 0.03
+
+# Teto de stake por aposta (fração da banca)
+STAKE_MAXIMO         = 0.02
 
 JOGOS_HISTORICO      = 10
 
@@ -736,7 +741,7 @@ def buscar_jogos_da_data(data_str: str, ttl_horas: float, budget: dict,
         elif idade < ttl_horas * 3600:
             return item.get("jogos", []), budget
     dados, budget = api_get("fixtures", {"date": data_str}, budget)
-    jogos = [j for j in dados if j.get("league", {}).get("id") in LIGAS]
+    jogos = [placar_90min(j) for j in dados if j.get("league", {}).get("id") in LIGAS]
     ts = agora
     if not dados:
         # a lista de um dia inteiro nunca vem vazia: é falha da API.
@@ -791,17 +796,30 @@ def buscar_jogos_finalizados(budget: dict):
             if j.get("fixture", {}).get("status", {}).get("short") in fim], budget
 
 
+def placar_90min(jogo: dict) -> dict:
+    """Troca "goals" pelo placar do tempo normal quando houve prorrogação.
+
+    Casas liquidam 1X2, gols e handicap pelos 90 minutos; "goals" da API
+    inclui a prorrogação (mata-mata de Libertadores/Champions).
+    """
+    ft = (jogo.get("score") or {}).get("fulltime") or {}
+    if ft.get("home") is not None and ft.get("away") is not None:
+        jogo = dict(jogo)
+        jogo["goals"] = {"home": ft["home"], "away": ft["away"]}
+    return jogo
+
+
 def buscar_ultimos_jogos(team_id: int, qtd: int, budget: dict):
     # Todas as competições: um time na Champions também tem jogos na liga nacional
     dados, budget = api_get("fixtures", {"team": team_id, "last": qtd}, budget)
-    return dados or [], budget
+    return [placar_90min(j) for j in dados or []], budget
 
 
 def buscar_h2h(id1: int, id2: int, qtd: int, budget: dict):
     dados, budget = api_get("fixtures/headtohead", {
         "h2h": f"{id1}-{id2}", "last": qtd,
     }, budget)
-    return dados or [], budget
+    return [placar_90min(j) for j in dados or []], budget
 
 
 def buscar_historico_completo(team_id: int, nome: str, budget: dict):
@@ -1112,10 +1130,6 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
     if rec:
 
-        stake   = kelly_stake(rec["prob"], rec["odd_fair"])
-
-        retorno = round(stake * rec["odd_fair"], 2)
-
         push_txt = (f" | Push: {rec['prob_push']:.1f}%" if rec["prob_push"] > 0 else "")
 
         # FIX #2: f-string fechada corretamente
@@ -1128,7 +1142,7 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
             f"   {'█' * round(rec['prob']/10)}{'░' * (10-round(rec['prob']/10))} {rec['prob']}%",
 
-            f"   Odd mínima p/ valer a pena: acima de {rec['odd_fair']}{push_txt}",
+            f"   Odd justa: {rec['odd_fair']}{push_txt}",
 
             "",
 
@@ -1142,7 +1156,7 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
             push_txt = (f" [Push:{h['prob_push']:.0f}%]" if h["prob_push"] > 2 else "")
 
-            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd mín. {h['odd_fair']}){push_txt}")
+            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd justa {h['odd_fair']}){push_txt}")
 
         linhas.append("")
 
@@ -1154,13 +1168,13 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
 
             push_txt = (f" [Push:{h['prob_push']:.0f}%]" if h["prob_push"] > 2 else "")
 
-            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd mín. {h['odd_fair']}){push_txt}")
+            linhas.append(f"   {h['linha']:+.2f} → {h['prob']}%  (odd justa {h['odd_fair']}){push_txt}")
 
         linhas.append("")
 
     linhas += [
 
-        "─" * 34, "📖 Como ler:",
+        "─" * 34, "📖 Como ler (linha do próprio time):",
 
         "  -1.5 = time precisa vencer por 2+",
 
@@ -1169,7 +1183,8 @@ def montar_bloco_handicap(ha_resultado: dict, nc: str, nf: str, stake_base: floa
         "  -0.5 = qualquer vitória ganha",
 
         "   0   = push se empatar",
-
+        "  -0.75 = vence por 1: meia vitória",
+        "  +0.25 = empate: meia vitória",
         "  +0.5 = ganha se empatar ou vencer",
 
     ]
@@ -1965,6 +1980,31 @@ def aplicar_platt_todos(probs: dict, platt_params: dict) -> dict:
 
 # ═══════════════════════════════════════════
 
+def lucro_aposta(mercado: str, gc: int, gf: int, odd: float, linha: float = None) -> float:
+    """Lucro por R$1 apostado, pelo placar de 90 min. Devolução (push) = 0.
+
+    Handicap asiático: "ah_casa"/"ah_fora" com a linha DO PRÓPRIO time.
+    Quarto de linha (±0.25, ±0.75…) = metade em cada linha vizinha:
+    ex. casa -0.75 vencendo por 1 gol = meia vitória (+0.5 x (odd-1)).
+    """
+    if mercado in ("ah_casa", "ah_fora"):
+        dif = gc - gf if mercado == "ah_casa" else gf - gc
+        partes = [linha - 0.25, linha + 0.25] if abs(round(linha * 4)) % 2 == 1 else [linha]
+        total = 0.0
+        for l in partes:
+            r = dif + l
+            total += (odd - 1) if r > 0 else (-1.0 if r < 0 else 0.0)
+        return round(total / len(partes), 4)
+    ganhou = {
+        "vitoria_casa": gc > gf, "empate": gc == gf, "vitoria_fora": gc < gf,
+        "btts": gc > 0 and gf > 0, "over25": gc + gf > 2,
+        "under25": gc + gf <= 2, "over15": gc + gf > 1,
+    }.get(mercado)
+    if ganhou is None:
+        raise ValueError(f"mercado sem liquidação: {mercado}")
+    return round(odd - 1, 4) if ganhou else -1.0
+
+
 def kelly_stake(prob: float, odd: float) -> float:
 
     if odd <= 1.0 or prob <= 0:
@@ -1981,7 +2021,7 @@ def kelly_stake(prob: float, odd: float) -> float:
 
         return 0.0
 
-    return round(min(f * KELLY_FRACAO * BANCA_PADRAO, BANCA_PADRAO * 0.15), 2)
+    return round(min(f * KELLY_FRACAO, STAKE_MAXIMO) * BANCA_PADRAO, 2)
 
 
 
@@ -2081,6 +2121,9 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
 
         "╚══════════════════════════════════╝",
 
+        "⚠️ Modo observação: em 6.486 jogos com odds",
+        "reais da Bet365 o modelo não superou a casa.",
+
         "",
 
     ]
@@ -2098,7 +2141,7 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
     if mercados_ok:
 
         linhas += [SEP, "🎯 MERCADOS MAIS PROVÁVEIS (modelo)", SEP,
-                   "Só vale apostar se a odd da casa for MAIOR que a odd mínima."]
+                   "Probabilidade estimada. Odd justa = sem margem da casa."]
 
         for idx, m in enumerate(mercados_ok, 1):
 
@@ -2108,7 +2151,7 @@ def montar_alerta(jogo: dict, probs_cal: dict, mc_met: dict, mf_met: dict,
                 "", f"#{idx} {m['label']}",
                 f"{barra(m['prob'])} {m['prob']}%",
                 f"Confiança: {nivel(m['prob'])}",
-                f"💰 Odd mínima: acima de {odd_min}",
+                f"💰 Odd justa: {odd_min}",
 
             ]
 
@@ -2333,79 +2376,37 @@ def calcular_impacto_desfalques(lesoes: list, id_time: int) -> dict:
 # ═══════════════════════════════════════════
 
 def calcular_value_bets(probs_cal: dict, odds_casas: dict) -> list:
-
+    """Divergências modelo x casa: melhor odd de cada mercado com EV > VALUE_MINIMO."""
     values = []
-
     for mercado, prob in probs_cal.items():
-
-        if prob <= 0: continue
-
-        for casa, odd in odds_casas.get(mercado, {}).items():
-
-            if odd <= 1.0: continue
-
-            prob_imp = round((1 / odd) * 100, 2)
-
-            value    = round((prob / 100) * odd - 1, 4)
-
-            edge     = round(prob - prob_imp, 2)
-
-            if value > 0.03:
-
-                stake   = kelly_stake(prob, odd)
-
-                retorno = round(stake * odd, 2)
-
-                values.append({
-
-                    "mercado": mercado, "label": LABELS.get(mercado, mercado),
-
-                    "casa": casa, "odd": odd, "prob_modelo": prob,
-
-                    "prob_implicita": prob_imp, "value": value, "edge": edge,
-
-                    "stake_kelly": stake, "retorno": retorno,
-
-                })
-
+        casas = {c: o for c, o in odds_casas.get(mercado, {}).items() if o > 1.0}
+        if prob <= 0 or not casas:
+            continue
+        casa, odd = max(casas.items(), key=lambda x: x[1])
+        value = round((prob / 100) * odd - 1, 4)
+        if value > VALUE_MINIMO:
+            values.append({
+                "mercado": mercado, "label": LABELS.get(mercado, mercado),
+                "casa": casa, "odd": odd, "prob_modelo": prob,
+                "prob_implicita": round(100 / odd, 2), "value": value,
+                "edge": round(prob - 100 / odd, 2),
+            })
     values.sort(key=lambda x: -x["value"])
-
     return values
 
 
-
 def montar_bloco_value_bets(values: list) -> str:
-
     if not values: return ""
-
     SEP    = "━" * 34
-
-    linhas = ["", SEP, "💎 VALUE BETS — MELHOR ODD POR CASA", SEP]
-
-    vistos = set()
-
-    for idx, v in enumerate(values[:5], 1):
-
-        chave = (v["mercado"], v["casa"])
-
-        if chave in vistos: continue
-
-        vistos.add(chave)
-
+    linhas = ["", SEP, "📝 DIVERGÊNCIAS MODELO x CASA (simulação)", SEP,
+              "Registradas para medir o ROI real. NÃO é dica de aposta:",
+              "no teste com odds reais da Bet365 (2022-26) essa regra",
+              "deu prejuízo (-11,9% em 1X2 e gols)."]
+    for idx, v in enumerate(values[:4], 1):
         linhas += [
-
-            "", f"#{idx} {v['label']}",
-
-            f"   🏢 Casa      : {v['casa']}", f"   💰 Odd       : {v['odd']}",
-
-            f"   📊 Prob modelo: {v['prob_modelo']}%", f"   📉 Prob impl : {v['prob_implicita']}%",
-
-            f"   📈 Edge      : +{v['edge']}%", f"   💎 Value     : {round(v['value']*100,1)}%",
-
-            f"   💵 Stake     : R${v['stake_kelly']}", f"   🎁 Retorno   : R${v['retorno']}",
-
+            "", f"#{idx} {v['label']} — {v['casa']} @ {v['odd']}",
+            f"   Modelo {v['prob_modelo']}% x casa {v['prob_implicita']}% (value {round(v['value']*100,1)}%)",
         ]
-
     return "\n".join(linhas)
 
 
@@ -2417,109 +2418,62 @@ def montar_bloco_value_bets(values: list) -> str:
 # ═══════════════════════════════════════════
 
 def processar_backtest(log: list, jogos_finalizados: list) -> dict:
+    """Liquida o log pelo placar de 90 min.
 
+    - acerto: mercados com prob >= PROB_MINIMA (sem dinheiro envolvido)
+    - ROI: só as divergências registradas (value_bets), com a odd real e stake fixo
+    """
     mapa = {}
-
     for j in jogos_finalizados:
-
-        fid = str(j.get("fixture", {}).get("id", ""))
-
-        gc  = j.get("goals", {}).get("home") or 0
-
-        gf  = j.get("goals", {}).get("away") or 0
-
-        mapa[fid] = {"gc": int(gc), "gf": int(gf)}
-
-    acertos_m = {}; total_m = {}; roi_m = {}; atualizados = 0
-
+        j  = placar_90min(j)
+        g  = j.get("goals", {})
+        if g.get("home") is None or g.get("away") is None:
+            continue
+        mapa[str(j.get("fixture", {}).get("id", ""))] = (int(g["home"]), int(g["away"]))
+    acertos_m = {}; total_m = {}; roi_m = {}; apostas_m = {}; atualizados = 0
     for entrada in log:
-
-        fid = entrada.get("fixture_id", "")
-
-        res = mapa.get(fid)
-
-        if not res or entrada.get("resultado") is not None: continue
-
-        gc, gf = res["gc"], res["gf"]
-
-        probs   = entrada.get("probs_calibradas", {})
-
+        res = mapa.get(entrada.get("fixture_id", ""))
+        if not res or entrada.get("resultado") is not None:
+            continue
+        gc, gf = res
         atualizados += 1
-
-        reais = {
-
-            "vitoria_casa": gc > gf, "empate": gc == gf, "vitoria_fora": gc < gf,
-
-            "btts": gc > 0 and gf > 0, "over25": gc + gf > 2,
-
-            "under25": gc + gf <= 2, "over15": gc + gf > 1,
-        }
-        # escanteios/cartões ficam de fora: não temos o resultado real deles
-        odds_reais = entrada.get("odds_reais", {}) or {}
-
         acertou_algum = False
-
-        for mercado, prob in probs.items():
-
+        for mercado, prob in entrada.get("probs_calibradas", {}).items():
             if prob < PROB_MINIMA: continue
-
-            ocorreu  = reais.get(mercado)
-            if ocorreu is None: continue
-            odd_real = odds_reais.get(mercado)
-            stake    = 10.0
-            # ROI só existe com a odd REAL registrada no alerta
-            lucro    = (round(stake * odd_real - stake, 2) if ocorreu else -stake) if odd_real else 0.0
-
+            try:
+                ocorreu = lucro_aposta(mercado, gc, gf, 2.0) > 0
+            except ValueError:
+                continue
             acertos_m[mercado] = acertos_m.get(mercado, 0) + (1 if ocorreu else 0)
-
             total_m[mercado]   = total_m.get(mercado, 0) + 1
-
-            roi_m[mercado]     = round(roi_m.get(mercado, 0.0) + lucro, 2)
-
-            if ocorreu: acertou_algum = True
-
+            acertou_algum = acertou_algum or ocorreu
+        for vb in entrada.get("apostas_simuladas", []):
+            l = lucro_aposta(vb["mercado"], gc, gf, vb["odd"], vb.get("linha"))
+            vb["lucro"] = round(10.0 * l, 2)
+            roi_m[vb["mercado"]]     = round(roi_m.get(vb["mercado"], 0.0) + vb["lucro"], 2)
+            apostas_m[vb["mercado"]] = apostas_m.get(vb["mercado"], 0) + 1
         entrada["resultado"]   = "acerto" if acertou_algum else "erro"
-
         entrada["placar_real"] = f"{gc}-{gf}"
-
-    return {"atualizados": atualizados, "acertos_mercado": acertos_m, "total_mercado": total_m, "roi_mercado": roi_m}
-
+    return {"atualizados": atualizados, "acertos_mercado": acertos_m, "total_mercado": total_m,
+            "roi_mercado": roi_m, "apostas_mercado": apostas_m}
 
 
 def montar_relatorio_backtest(bt: dict, placar: str = "", nc: str = "", nf: str = "") -> str:
-
     if bt["atualizados"] == 0: return ""
-
-    SEP       = "━" * 34
-
-    roi_total = sum(bt["roi_mercado"].values())
-
-    roi_tag   = f"+R${roi_total:.2f}" if roi_total >= 0 else f"-R${abs(roi_total):.2f}"
-
-    linhas    = [SEP, "📊 RESULTADO ATUALIZADO", SEP]
-
+    SEP    = "━" * 34
+    linhas = [SEP, "📊 RESULTADO ATUALIZADO", SEP]
     if nc and nf and placar: linhas += [f"⚽ {nc} {placar} {nf}", ""]
-
-    linhas += [f"✅ {bt['atualizados']} jogo(s) processado(s)", f"💰 ROI do ciclo: {roi_tag}", "", SEP, "Por mercado:", SEP]
-
-    for mercado in sorted(bt["total_mercado"], key=lambda m: -bt["acertos_mercado"].get(m,0)):
-
+    linhas += [f"✅ {bt['atualizados']} jogo(s) processado(s)", "", "Acerto das indicações (prob ≥ corte):"]
+    for mercado in sorted(bt["total_mercado"], key=lambda m: -bt["total_mercado"][m]):
         tot  = bt["total_mercado"][mercado]
-
         acer = bt["acertos_mercado"].get(mercado, 0)
-
-        roi  = bt["roi_mercado"].get(mercado, 0.0)
-
-        taxa = round(acer / tot * 100, 1) if tot else 0
-
-        roi_m = f"+R${roi:.2f}" if roi >= 0 else f"-R${abs(roi):.2f}"
-
-        icon  = "✅" if taxa >= 60 else "⚡" if taxa >= 50 else "❌"
-
-        linhas.append(f"{icon} {LABELS.get(mercado,mercado)}: {acer}/{tot} ({taxa}%) | {roi_m}")
-
+        linhas.append(f"  {LABELS.get(mercado, mercado)}: {acer}/{tot}")
+    if bt.get("apostas_mercado"):
+        n   = sum(bt["apostas_mercado"].values())
+        tot = sum(bt["roi_mercado"].values())
+        linhas += ["", f"📝 Simulação (R$10 por divergência): {n} aposta(s) | "
+                       f"{'+' if tot >= 0 else '-'}R${abs(tot):.2f}"]
     return "\n".join(linhas)
-
 
 
 # ═══════════════════════════════════════════
@@ -2554,7 +2508,7 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
 
     taxa   = round(acert / total * 100, 1) if total else 0
 
-    roi_semana = {}; acc_semana = {}; tot_semana = {}
+    roi_semana = {}; acc_semana = {}; tot_semana = {}; n_sim = {}
 
     for e in com_resultado:
 
@@ -2569,24 +2523,23 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
             "under25": gc + gf <= 2, "over15": gc + gf > 1,
         }
 
-        odds_reais = e.get("odds_reais", {}) or {}
-
         for merc, prob in e.get("probs_calibradas", {}).items():
 
             if prob < PROB_MINIMA or merc not in reais: continue
 
             ocorreu  = reais[merc]
 
-            odd_real = odds_reais.get(merc)
-
-            lucro    = ((round(10 * odd_real - 10, 2) if ocorreu else -10.0)
-                        if odd_real else 0.0)
-
-            roi_semana[merc] = round(roi_semana.get(merc, 0) + lucro, 2)
-
             acc_semana[merc] = acc_semana.get(merc, 0) + (1 if ocorreu else 0)
 
             tot_semana[merc] = tot_semana.get(merc, 0) + 1
+
+        for vb in e.get("apostas_simuladas", []):
+
+            if "lucro" in vb:
+
+                roi_semana[vb["mercado"]] = round(roi_semana.get(vb["mercado"], 0) + vb["lucro"], 2)
+
+                n_sim[vb["mercado"]] = n_sim.get(vb["mercado"], 0) + 1
 
     data_str = agora_brt().strftime("%d/%m/%Y")
 
@@ -2596,15 +2549,14 @@ def gerar_relatorio_semanal(log: list, jogos_proximos: list) -> str:
 
                 f"Indicações: {total} | Acertos: {acert} ({taxa}%)", "", "Por mercado:"]
 
-    for merc in sorted(tot_semana, key=lambda m: -acc_semana.get(m,0)):
-
-        t = tot_semana[merc]; a = acc_semana.get(merc, 0); r = roi_semana.get(merc, 0)
-
-        tx = round(a / t * 100, 1) if t else 0
-
-        roi_tag = f"+R${r:.2f}" if r >= 0 else f"-R${abs(r):.2f}"
-
-        linhas.append(f"  {LABELS.get(merc, merc)}: {a}/{t} ({tx}%) | {roi_tag}")
+    for merc in sorted(tot_semana, key=lambda m: -tot_semana[m]):
+        t = tot_semana[merc]; a = acc_semana.get(merc, 0)
+        linhas.append(f"  {LABELS.get(merc, merc)}: {a}/{t} ({round(a / t * 100, 1) if t else 0}%)")
+    if n_sim:
+        r_tot = sum(roi_semana.values()); n_tot = sum(n_sim.values())
+        roi_pct = r_tot / (10 * n_tot) * 100
+        linhas += ["", "📝 Simulação das divergências (R$10 cada):",
+                   f"  {n_tot} apostas | {'+' if r_tot >= 0 else '-'}R${abs(r_tot):.2f} | ROI {roi_pct:+.1f}%"]
 
     if jogos_proximos:
 
@@ -3024,10 +2976,9 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
     value_bets = calcular_value_bets(probs_cal, odds_reais) if odds_reais else []
     if odds_reais:
         bloco_vb = montar_bloco_value_bets(value_bets) or (
-            "\n" + "━" * 34 + "\n💎 Odds reais conferidas: nenhuma value bet acima de 3%.")
+            "\n" + "━" * 34 + "\n📝 Odds reais conferidas: modelo e casas concordam.")
     else:
-        bloco_vb = ("\n" + "━" * 34 + "\n💎 Sem odds reais das casas para este jogo "
-                    "— value bet não calculada.")
+        bloco_vb = ("\n" + "━" * 34 + "\n📝 Sem odds reais das casas para este jogo.")
     melhor_odd = {m: max(c.values()) for m, c in odds_reais.items() if c}
 
     alerta = montar_alerta(
@@ -3056,6 +3007,8 @@ def analisar_jogo(jogo: dict, budget: dict, cache: dict, jogos_finalizados: list
             "probs_poisson": r["probs_poisson"], "probs_mc": r["probs_mc"], "probs_calibradas": probs_cal,
             "handicap_recomendado": r["ha_resultado"].get("recomendada"),
             "value_bets": [v["mercado"] for v in value_bets[:3]],
+            "apostas_simuladas": [{"mercado": v["mercado"], "casa": v["casa"], "odd": v["odd"],
+                                   "prob": v["prob_modelo"]} for v in value_bets[:4]],
             "odds_reais": melhor_odd,
             "line_movement": movimentos, "resultado": None, "placar_real": None,
         })
@@ -3241,7 +3194,7 @@ if __name__ == "__main__":
 
     print("║  [10] Lesões e desfalques                          ║")
 
-    print("║  [11] Value Bet com odds REAIS das casas           ║")
+    print("║  [11] Divergências x odds reais (simulação)        ║")
 
     print("║  [12] Backtest automático                          ║")
 
@@ -3293,13 +3246,13 @@ if __name__ == "__main__":
 
         "  📊 Score de confiança 0-100\n"
 
-        "  🏥 Lesões e desfalques\n  💎 Value Bet multi-casa\n"
+        "  🏥 Lesões e desfalques\n  📝 Simulação x odds reais\n"
 
         "  📋 Backtest automático\n  📅 Relatório semanal\n"
 
         "  🧠 Autoaprendizado\n  🎲 Handicap asiático\n\n"
 
-        f"  Prob ≥ {PROB_MINIMA}% | Kelly {int(KELLY_FRACAO*100)}% | BRT"
+        f"  Prob ≥ {PROB_MINIMA}% | modo observação | BRT"
 
     )
 

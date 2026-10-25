@@ -62,18 +62,59 @@ Força de ataque/defesa de cada time pelos últimos 10 jogos (com peso de recên
 vezes a média de gols de mandante/visitante — Poisson com Dixon-Coles.
 
 ## Limites que continuam (honestidade)
-- **Calibrado não é lucrativo.** O backtest mede se as probabilidades batem com a
-  realidade; ele não prova que o modelo vence as odds das casas, que já embutem
-  tudo isso. Value bet só vale com odd real acima da odd mínima, e mesmo assim
-  precisa de semanas de registro (relatório semanal) antes de apostar dinheiro sério.
-- Ambas Marcam e Over/Under ficam no nível do "chute pela média": o modelo não tem
-  vantagem real nesses mercados.
+- **Calibrado não é lucrativo** — confirmado na auditoria 2 abaixo.
+- Ambas Marcam e Over/Under ficam no nível do "chute pela média".
 - Sem xG (custa chamadas extras no plano grátis).
 - Plano grátis da API-Football: não confirmado se libera a temporada atual.
 
+---
+
+# Auditoria 2 — Regras de aposta (25/10/2026)
+
+## Teste contra odds REAIS da Bet365 (2022-07 → 2026)
+6.486 jogos (Premier, La Liga, Serie A, Bundesliga, Brasileirão), modelo vendo só o
+passado. Dados: github.com/xgabora/Club-Football-Match-Data-2000-2025.
+
+| Estratégia | Apostas | ROI |
+|---|---|---|
+| Apostar em tudo na Bet365 (sem modelo) | 42.365 | −5,3% (margem da casa) |
+| **Regra do bot: value > 3% (1X2 + Over/Under 2.5)** | 12.132 | **−11,9% ± 2,9%** |
+| Mesma regra com a melhor odd de ~17 casas | 14.029 | −6,3% |
+| Handicap asiático visitante (value > 3%) | 2.839 | +4,5% ± 3,3% — **não confiável**: temporada atual −6,6%, e apostar em todo AH visitante sem modelo já dava +0,6% |
+
+Banca simulada de R$1.000 com a regra: zerada com Kelly do código, com Kelly 10%/teto 2%
+e com stake fixo de 1%.
+
+**Conclusão:** quando o modelo discorda da Bet365, na maior parte das vezes o errado
+é o modelo. A regra "odd acima da odd justa = aposta" perde dinheiro. Por isso o bot
+passou para **modo observação**: continua mandando as análises e registra as
+divergências como **apostas simuladas**, e o relatório semanal mostra o ROI real
+delas. Só faz sentido apostar se esse ROI ficar positivo por vários meses.
+
+## Bugs de regra corrigidos
+1. **ROI media a estratégia errada** — "apostava" em todo mercado ≥ 58%, não nas
+   value bets que o alerta sugeria. Agora o ROI vem só das apostas simuladas,
+   gravadas no log com casa e odd.
+2. **Prorrogação** — mata-mata (Libertadores/Champions) seria liquidado com o placar
+   da prorrogação. Casas liquidam pelos 90 min: agora usa `score.fulltime`.
+3. **Handicap asiático sem liquidação** — criada `lucro_aposta()` com linhas inteiras
+   (devolução), meias e quartos (meia vitória / meia derrota). 33 casos conferidos à mão.
+4. **Stake de até 15% da banca** numa aposta e banca fixa no código — teto de 2% e
+   banca por variável `BANCA`. Stake não aparece mais no alerta.
+5. Mesmo mercado repetido uma vez por casa — agora só a melhor odd.
+6. Texto "só vale apostar se a odd for maior que a mínima" — era exatamente a regra
+   que perde dinheiro; trocado por "odd justa" e aviso de modo observação.
+7. `EDGE_MINIMO` declarado e nunca usado — removido (`VALUE_MINIMO = 0.03`).
+
+Conferido também: a odd justa do handicap (inclusive quartos de linha) dá EV ≈ 0 pela
+liquidação exata; Kelly fracionado e cálculo de value batem com a fórmula.
+
 ## Como repetir os testes
 ```
+python3 testes/teste_regras.py                       # 57 testes de regras e liquidação
 python3 testes/teste_falhas.py                       # 9 cenários de falha
 git clone --depth 1 https://github.com/openfootball/football.json
 OPENFOOTBALL_DIR=football.json python3 testes/backtest_real.py
+git clone --depth 1 https://github.com/xgabora/Club-Football-Match-Data-2000-2025
+python3 testes/backtest_odds.py                      # regra x odds reais da Bet365
 ```
